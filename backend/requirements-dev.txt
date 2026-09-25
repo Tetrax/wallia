@@ -1,0 +1,6 @@
+# Wallia — dépendances de développement / tests (incluses dans l'image pour exécuter la suite en conteneur)
+-r requirements.txt
+pytest
+pytest-timeout
+reportlab
+requests

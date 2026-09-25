@@ -1,0 +1,20 @@
+# Contexte de build : n'embarquer que le nécessaire.
+.git
+.gitignore
+.github
+runtime/
+docs/
+tests/e2e/node_modules/
+tests/e2e/test-results/
+tests/e2e/playwright-report/
+frontend/node_modules/
+frontend/dist/
+node_modules/
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/*.log
+.venv/
+venv/
+fixtures/corpus/
+README.md

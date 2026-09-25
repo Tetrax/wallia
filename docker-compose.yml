@@ -1,0 +1,170 @@
+# Wallia — Compose projet dédié (préfixe obligatoire : docker compose -p wallia)
+# Seule l'API est publiée, sur 127.0.0.1:13745. Aucun port hôte pour la DB ni le worker.
+
+name: wallia
+
+x-common-env: &common-env
+  WALLIA_ENV: ${WALLIA_ENV:-local}
+  WALLIA_APP_VERSION: ${WALLIA_APP_VERSION:-0.1.0}
+  WALLIA_SECRETS_DIR: /secrets
+  WALLIA_DATA_DIR: /data
+  WALLIA_MODEL_DIR: /opt/models/e5-small
+  WALLIA_DOCLING_MODELS: /opt/docling-models
+  WALLIA_FRONTEND_DIR: /app/static
+  WALLIA_EMBEDDING_REVISION: ${WALLIA_EMBEDDING_REVISION:-614241f622f53c4eeff9890bdc4f31cfecc418b3}
+  WALLIA_ALLOWED_ORIGINS: ${WALLIA_ALLOWED_ORIGINS:-http://localhost:13745,http://127.0.0.1:13745}
+  WALLIA_COOKIE_SECURE: ${WALLIA_COOKIE_SECURE:-0}
+  WALLIA_TRUSTED_PROXY_CIDRS: ${WALLIA_TRUSTED_PROXY_CIDRS:-172.31.245.0/24,127.0.0.1/32,::1/128}
+  WALLIA_PROVIDER_ALLOWED_DOMAINS: ${WALLIA_PROVIDER_ALLOWED_DOMAINS:-api.deepseek.com}
+  WALLIA_PROVIDER_ENDPOINT: ${WALLIA_PROVIDER_ENDPOINT:-https://api.deepseek.com/v1}
+  WALLIA_PROVIDER_MODEL: ${WALLIA_PROVIDER_MODEL:-deepseek-flash}
+  WALLIA_VISION_ENABLED: ${WALLIA_VISION_ENABLED:-0}
+  WALLIA_WEB_ENABLED: ${WALLIA_WEB_ENABLED:-0}
+  WALLIA_TORCH_THREADS: "2"
+
+x-db-env: &db-env
+  WALLIA_DB_HOST: db
+  WALLIA_DB_PORT: "5432"
+  WALLIA_DB_NAME: wallia
+  WALLIA_DB_USER: wallia
+  WALLIA_DB_PASSWORD_FILE: /secrets/db_password
+
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: wallia
+      POSTGRES_USER: wallia
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    volumes:
+      - wallia_pgdata:/var/lib/postgresql/data
+      - ./runtime/secrets/db_password:/run/secrets/db_password:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wallia -d wallia"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    mem_limit: 512m
+    cpus: 1.0
+    logging: &logging
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+    networks: [wallia]
+
+  api:
+    image: ${WALLIA_IMAGE:-wallia:local}
+    build:
+      context: .
+      args:
+        WALLIA_GIT_SHA: ${WALLIA_GIT_SHA:-dev}
+        WALLIA_BUILD_DATE: ${WALLIA_BUILD_DATE:-unknown}
+    restart: unless-stopped
+    environment:
+      <<: [*common-env, *db-env]
+      WALLIA_API_BASE_URL: http://api:8000
+    volumes:
+      - ./runtime/data:/data
+      - ./runtime/evidence/container:/data/evidence
+      - ./runtime/secrets:/secrets
+    ports:
+      - "127.0.0.1:13745:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=768m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    # La limite de l'API est paramétrable : la suite de tests démarre un serveur
+    # supplémentaire DANS ce conteneur (scripts/acceptance.sh relève la limite).
+    mem_limit: ${WALLIA_API_MEM_LIMIT:-1200m}
+    cpus: 2.0
+    logging: *logging
+    networks: [wallia]
+
+  worker:
+    image: ${WALLIA_IMAGE:-wallia:local}
+    restart: unless-stopped
+    command: ["python", "-m", "app.worker"]
+    environment:
+      <<: [*common-env, *db-env]
+      WALLIA_API_BASE_URL: http://api:8000
+    volumes:
+      - ./runtime/data:/data
+      - ./runtime/evidence/container:/data/evidence
+      - ./runtime/secrets:/secrets
+    depends_on:
+      db:
+        condition: service_healthy
+      api:
+        condition: service_started
+    read_only: true
+    tmpfs:
+      - /tmp:size=768m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    # La limite du worker est paramétrable : l'ingestion Docling est gourmande
+    # en mémoire (WALLIA_WORKER_MEM_LIMIT pour l'ajuster sans toucher au fichier).
+    mem_limit: ${WALLIA_WORKER_MEM_LIMIT:-1800m}
+    cpus: 2.0
+    healthcheck:
+      # Le worker n'expose aucun port : on vérifie le processus ET sa
+      # dépendance réelle (PostgreSQL), jamais un service HTTP inexistant.
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import pathlib, sys;
+          sys.exit(0 if b'app.worker' in pathlib.Path('/proc/1/cmdline').read_bytes() else 1)"
+          && python -c "from sqlalchemy import create_engine, text; from app.config import get_settings;
+          conn = create_engine(get_settings().db_url).connect();
+          conn.execute(text('select 1')); conn.close()"
+          || exit 1
+      interval: 20s
+      timeout: 10s
+      retries: 4
+      start_period: 40s
+    logging: *logging
+    networks: [wallia]
+
+  # Outil de test local uniquement (jamais démarré en production) :
+  # faux fournisseur OpenAI-compatible pour exercer streaming/stop/erreurs.
+  fake-upstream:
+    image: ${WALLIA_IMAGE:-wallia:local}
+    profiles: ["testtools"]
+    command: ["uvicorn", "tests.fake_upstream:app", "--host", "0.0.0.0", "--port", "8990", "--no-access-log"]
+    environment:
+      WALLIA_ENV: test
+      WALLIA_FAKE_TOKEN: ${WALLIA_FAKE_TOKEN:-}
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8990/state', timeout=4)" || exit 1
+      interval: 15s
+      timeout: 6s
+      retries: 4
+      start_period: 15s
+    logging: *logging
+    networks: [wallia]
+
+volumes:
+  wallia_pgdata:
+    name: wallia_pgdata
+
+networks:
+  wallia:
+    name: wallia_net
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.245.0/24

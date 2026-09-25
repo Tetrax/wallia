@@ -4,7 +4,7 @@
 runtime/
 *.pem
 *.key
-!deploy/tls/*.example
+!deployment/tls/*.example
 .env
 .env.*
 !.env.example

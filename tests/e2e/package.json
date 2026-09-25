@@ -1,0 +1,10 @@
+{
+  "name": "wallia-e2e",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Tests navigateur Wallia (Playwright) — packages isolés du frontend applicatif",
+  "devDependencies": {
+    "@playwright/test": "1.63.0",
+    "@types/node": "22.10.2"
+  }
+}

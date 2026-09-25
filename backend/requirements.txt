@@ -1,0 +1,17 @@
+# Wallia — dépendances backend (runtime)
+# NOTE: torch/torchvision CPU sont installés séparément (voir requirements-torch-cpu.txt)
+#       puis figés dans requirements.lock.txt après résolution réelle.
+
+fastapi
+uvicorn[standard]
+sqlalchemy>=2.0
+psycopg[binary]>=3.1
+pgvector
+python-multipart
+argon2-cffi
+httpx
+pypdf
+pillow
+sentence-transformers
+transformers
+docling

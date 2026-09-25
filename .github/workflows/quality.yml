@@ -1,0 +1,97 @@
+name: quality
+
+# Contrôle requis par la protection de branche : le job s'appelle « quality ».
+# Aucun appel payant : DB pgvector en service, embeddings en backend « fixture »
+# (les embeddings réels et Docling sont exercés en acceptance locale dans l'image).
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Ce workflow n'utilise aucune entrée non fiable dans les `run:` (pas de
+# github.event.*, pas de refs dynamiques) : aucune surface d'injection de commandes.
+
+jobs:
+  quality:
+    name: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    services:
+      db:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_DB: wallia
+          POSTGRES_USER: wallia
+          POSTGRES_PASSWORD: wallia
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U wallia -d wallia"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      WALLIA_ENV: test
+      WALLIA_EMBEDDING_BACKEND: fixture
+      WALLIA_TEST_DB_URL: postgresql+psycopg://wallia:wallia@127.0.0.1:5432/wallia
+
+    steps:
+      - name: Récupération du dépôt
+        uses: actions/checkout@v4
+
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements-ci.txt
+
+      - name: Dépendances backend (chemin CI)
+        run: pip install -r backend/requirements-ci.txt
+
+      - name: Vérification de compilation
+        run: python -m compileall -q backend/app backend/tests
+
+      - name: Tests backend (PostgreSQL + pgvector réels)
+        working-directory: backend
+        run: python -m pytest -q tests
+
+      - name: Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Frontend — types + build
+        working-directory: frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - name: Aucun secret dans le bundle frontend
+        run: |
+          set -euo pipefail
+          if grep -rInE '(sk-[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----)' frontend/dist; then
+            echo "::error::secret potentiel détecté dans frontend/dist"
+            exit 1
+          fi
+
+      - name: Hygiène du dépôt (runtime, secrets, artefacts)
+        run: |
+          set -euo pipefail
+          if git ls-files | grep -qE '^(runtime/|frontend/node_modules/|tests/e2e/node_modules/)'; then
+            echo "::error::des fichiers runtime/node_modules sont versionnés"
+            exit 1
+          fi
+          if git ls-files | grep -qE '(\.env$|\.pem$|\.key$|db_password$|provider_api_key$|initial-access\.txt$)'; then
+            echo "::error::un fichier de secret est versionné"
+            exit 1
+          fi
+          echo "Hygiène du dépôt : OK"

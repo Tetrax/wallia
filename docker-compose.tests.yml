@@ -1,0 +1,18 @@
+# Wallia — override de TEST LOCAL uniquement (ne pas utiliser en livraison).
+#
+# Monte le code backend depuis le poste de travail pour itérer sur les tests sans
+# reconstruire l'image :
+#   docker compose -p wallia -f docker-compose.yml -f docker-compose.tests.yml up -d api
+#   docker compose -p wallia -f docker-compose.yml -f docker-compose.tests.yml exec -T api \
+#       python -m pytest -q tests
+# La validation finale s'exécute SANS cet override (code réellement embarqué dans l'image).
+
+services:
+  api:
+    volumes:
+      - ./backend:/app
+      - ./resources:/app/resources
+      - ./fixtures:/app/fixtures
+  worker:
+    volumes:
+      - ./backend:/app
