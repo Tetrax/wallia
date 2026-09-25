@@ -1,0 +1,54 @@
+# Wallia — dépôt applicatif
+
+# --- Secrets, données locales, runtime : JAMAIS versionnés ---
+runtime/
+*.pem
+*.key
+!deploy/tls/*.example
+.env
+.env.*
+!.env.example
+secrets/
+credentials*.json
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# --- Node / frontend ---
+node_modules/
+frontend/dist/
+frontend/.vite/
+*.tsbuildinfo
+coverage/
+
+# --- Tests navigateur ---
+.playwright/
+test-results/
+playwright-report/
+blob-report/
+
+# --- Logs, caches, données locales ---
+*.log
+logs/
+uploads/
+backups/
+*.dump
+*.sql.gz
+data/
+pgdata/
+
+# --- Éditeurs / OS ---
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
