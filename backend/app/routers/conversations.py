@@ -8,12 +8,32 @@ from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from ..deps import AuthContext, csrf_guard, require_user
-from ..models import Attachment, Conversation, Message
+from ..models import Attachment, Conversation, Document, Message
 from ..schemas import CaseStatePatch, ConversationIn, ConversationPatch, case_state_patch_to_raw, normalize_case_state
 from ..security import sanitize_text
 from ..serializers import attachment_out, conversation_out, message_out
 
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
+
+
+def _existing_document_ids(db: Session, messages: list[Message]) -> set[str]:
+    """Existence réelle des documents cités par les snapshots de sources.
+
+    Un seul aller-retour, jamais une renumérotation : les excerpts historiques
+    restent affichables, seuls les documents disparus sont marqués indisponibles.
+    """
+    ids: set[uuid.UUID] = set()
+    for message in messages:
+        for source in message.sources or []:
+            if isinstance(source, dict) and source.get("document_id"):
+                try:
+                    ids.add(uuid.UUID(str(source["document_id"])))
+                except (TypeError, ValueError, AttributeError):
+                    continue
+    if not ids:
+        return set()
+    rows = db.execute(select(Document.id).where(Document.id.in_(ids))).scalars().all()
+    return {str(row) for row in rows}
 
 
 def get_owned_conversation(db: Session, auth: AuthContext, conversation_id: uuid.UUID) -> Conversation:
@@ -79,9 +99,10 @@ def get_conversation(conversation_id: uuid.UUID, auth: AuthContext = Depends(req
     attachments = auth.db.execute(
         select(Attachment).where(Attachment.conversation_id == conv.id).order_by(Attachment.created_at.asc())
     ).scalars().all()
+    available = _existing_document_ids(auth.db, messages)
     return {
         **conversation_out(conv, message_count=len(messages)),
-        "messages": [message_out(m) for m in messages],
+        "messages": [message_out(m, available_document_ids=available) for m in messages],
         "attachments": [attachment_out(a) for a in attachments],
     }
 
@@ -128,7 +149,8 @@ def list_messages(conversation_id: uuid.UUID, auth: AuthContext = Depends(requir
     messages = auth.db.execute(
         select(Message).where(Message.conversation_id == conv.id).order_by(Message.seq.asc())
     ).scalars().all()
-    return {"messages": [message_out(m) for m in messages]}
+    available = _existing_document_ids(auth.db, messages)
+    return {"messages": [message_out(m, available_document_ids=available) for m in messages]}
 
 
 @router.patch("/{conversation_id}/case_state")

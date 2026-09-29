@@ -17,7 +17,6 @@ export function SettingsView({
   const [model, setModel] = useState("");
   const [timeoutS, setTimeoutS] = useState(240);
   const [apiKey, setApiKey] = useState("");
-  const [minCosine, setMinCosine] = useState(0.84);
   const [busy, setBusy] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<{ ok: boolean; error: string | null; latency_ms: number | null; model: string } | null>(null);
   const [currentPassword, setCurrentPassword] = useState("");
@@ -31,7 +30,6 @@ export function SettingsView({
       setEndpoint(payload.provider.endpoint);
       setModel(payload.provider.model);
       setTimeoutS(payload.provider.timeout_s);
-      setMinCosine(payload.retrieval.min_cosine);
     } catch (error) {
       toast("error", `Réglages illisibles : ${(error as Error).message}`);
     }
@@ -72,19 +70,6 @@ export function SettingsView({
       onRefreshStatus();
     } catch (error) {
       toast("error", `Test impossible : ${(error as Error).message}`);
-    } finally {
-      setBusy(null);
-    }
-  };
-
-  const saveRetrieval = async () => {
-    setBusy("retrieval");
-    try {
-      const payload = await api.putSettings({ retrieval_min_cosine: minCosine });
-      setSettings(payload);
-      toast("success", "Barrière de pertinence enregistrée.");
-    } catch (error) {
-      toast("error", `Enregistrement impossible : ${(error as Error).message}`);
     } finally {
       setBusy(null);
     }
@@ -154,7 +139,13 @@ export function SettingsView({
             {settings?.provider.endpoint ?? "—"} · {settings?.provider.model ?? "—"}
           </p>
           <p>
-            <Badge tone="warn">vision inactive</Badge>
+            {status?.vision.available ? (
+              <Badge tone="ok">vision active</Badge>
+            ) : (
+              <Badge tone="warn" title={status?.vision.reason ?? "analyse d'image inactive"}>
+                vision inactive
+              </Badge>
+            )}
           </p>
           {settings?.last_provider_test ? (
             <p className="muted small">
@@ -186,8 +177,13 @@ export function SettingsView({
         <div className="card">
           <h4>Recherche hybride</h4>
           <p className="muted small">
-            fusion RRF (vecteur cosine + plein texte), top-k {status?.retrieval.top_k ?? "—"}, barrière de pertinence{" "}
-            {settings?.retrieval.min_cosine ?? "—"}
+            fusion RRF (vecteur 384 + plein texte), top-k {status?.retrieval.top_k ?? "—"}, puis reclassement par
+            cross-encoder : <code>{status?.retrieval.reranker?.model ?? "—"}</code>
+          </p>
+          <p className="muted small">
+            révision {status?.retrieval.reranker?.revision?.slice(0, 12) ?? "—"}… · état{" "}
+            {status?.retrieval.reranker?.state ?? "inconnu"} · seuil de logit{" "}
+            {status?.retrieval.reranker?.threshold ?? "—"} (gelé, non ajustable)
           </p>
           <p className="muted small">
             Le corpus de démonstration est fictif et non officiel : aucun résultat ne constitue une procédure constructeur.
@@ -236,7 +232,17 @@ export function SettingsView({
           l'API ni incluse dans le frontend.
         </p>
         <div className="modal-actions">
-          <button type="button" className="btn btn-ghost" onClick={() => void saveProvider(true)} disabled={busy !== null}>
+          <button
+            type="button"
+            className="btn btn-ghost"
+            onClick={() => {
+              // Suppression de clé : confirmation explicite, jamais silencieuse.
+              if (window.confirm("Supprimer la clé API du fournisseur ? Les générations repasseront en mode démonstration.")) {
+                void saveProvider(true);
+              }
+            }}
+            disabled={busy !== null || !settings?.provider.key_configured}
+          >
             Supprimer la clé
           </button>
           <button type="button" className="btn" onClick={() => void testProvider()} disabled={busy !== null}>
@@ -253,36 +259,6 @@ export function SettingsView({
               : `Test en échec : ${testResult.error}`}
           </p>
         ) : null}
-      </form>
-
-      <h3 className="section-title">Barrière de pertinence (recherche)</h3>
-      <form
-        className="form-grid card"
-        onSubmit={(event) => {
-          event.preventDefault();
-          void saveRetrieval();
-        }}
-      >
-        <label>
-          Cosinus minimal pour considérer une source pertinente
-          <input
-            type="number"
-            step={0.01}
-            min={0}
-            max={1}
-            value={minCosine}
-            onChange={(event) => setMinCosine(Number(event.target.value))}
-          />
-        </label>
-        <p className="muted small">
-          Les scores E5 se concentrent haut (≈ 0,7–1) : une source lexicalement présente est acceptée même sous la
-          barrière. Valeur par défaut calibrée sur le corpus de démonstration, ajustable par l'opérateur.
-        </p>
-        <div className="modal-actions">
-          <button type="submit" className="btn btn-primary" disabled={busy !== null}>
-            Enregistrer
-          </button>
-        </div>
       </form>
 
       <h3 className="section-title">Mot de passe</h3>

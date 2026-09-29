@@ -1,5 +1,7 @@
 # syntax=docker/dockerfile:1.7
 # Wallia — image unique API/worker (frontend intégré), CPU uniquement.
+# Modèles pinnés (E5, reranker, Docling layout Heron/tableformer), un seul
+# format de poids, manifestes SHA256 vérifiés ; aucun bind de développement.
 
 # --- Frontend (React/TS/Vite) ---
 FROM node:22-bookworm-slim AS frontend
@@ -14,10 +16,10 @@ FROM python:3.12-slim-bookworm AS runtime
 
 ARG WALLIA_GIT_SHA=dev
 ARG WALLIA_BUILD_DATE=unknown
-ARG EMBEDDING_MODEL_REVISION=614241f622f53c4eeff9890bdc4f31cfecc418b3
 
 LABEL org.opencontainers.image.title="wallia" \
       org.opencontainers.image.description="Wallia — prototype de support technique (non officiel)" \
+      org.opencontainers.image.source="https://github.com/Tetrax/wallia" \
       org.opencontainers.image.revision="${WALLIA_GIT_SHA}" \
       org.opencontainers.image.created="${WALLIA_BUILD_DATE}"
 
@@ -38,29 +40,43 @@ RUN apt-get update \
  && groupadd -g 1002 wallia \
  && useradd -u 1002 -g 1002 -M -d /tmp -s /usr/sbin/nologin wallia
 
-COPY backend/requirements-torch-cpu.txt /tmp/req-torch.txt
-RUN pip install -r /tmp/req-torch.txt
+# Dépendances Python : lock versionné RÉEL (pip freeze de l'environnement de
+# référence). torch CPU d'abord, depuis l'index CPU officiel (aucune variante
+# CUDA possible), puis le lock complet — aucune résolution flottante.
+COPY backend/requirements-torch-cpu.txt backend/requirements.lock.txt /tmp/
+RUN pip install -r /tmp/requirements-torch-cpu.txt \
+ && pip install -r /tmp/requirements.lock.txt \
+ && python -c "import torch; assert torch.__version__.endswith('+cpu'), torch.__version__"
 
-COPY backend/requirements.txt backend/requirements-dev.txt /tmp/
-RUN pip install -r /tmp/requirements-dev.txt
-
-# Modèles CPU pinnés (embeddings E5 + Docling), aucune variante CUDA.
-# HF_HUB_OFFLINE=1 (posé plus haut pour l'exécution) est levé le temps du téléchargement.
+# Modèles CPU pinnés (E5 + reranker + Docling layout/tableformer) à révisions
+# immuables, fichiers explicitement listés, un seul format de poids
+# (safetensors) ; manifestes SHA256 écrits PUIS vérifiés. HF_HUB_OFFLINE=1
+# (posé pour l'exécution) n'est levé que pendant ce téléchargement explicite.
 COPY scripts/fetch_models.py /tmp/fetch_models.py
-RUN EMBEDDING_MODEL_REVISION=${EMBEDDING_MODEL_REVISION} HF_HUB_OFFLINE=0 python /tmp/fetch_models.py \
-      --model-dir /opt/models/e5-small --docling-dir /opt/docling-models \
- && rm -f /tmp/fetch_models.py /tmp/req-torch.txt /tmp/requirements-dev.txt /tmp/requirements.txt
+RUN HF_HUB_OFFLINE=0 python /tmp/fetch_models.py \
+      --model-dir /opt/models/e5-small \
+      --reranker-dir /opt/models/reranker \
+      --docling-dir /opt/docling-models \
+ && python /tmp/fetch_models.py --verify \
+      --model-dir /opt/models/e5-small \
+      --reranker-dir /opt/models/reranker \
+      --docling-dir /opt/docling-models \
+ && rm -f /tmp/fetch_models.py /tmp/requirements-torch-cpu.txt /tmp/requirements.lock.txt
 
 WORKDIR /app
 COPY backend/ /app/
 COPY resources/ /app/resources/
 COPY fixtures/ /app/fixtures/
 COPY --from=frontend /src/frontend/dist /app/static
-RUN chown -R wallia:wallia /app /opt/models /opt/docling-models \
+# Poids et code restent root-owned (immuables au runtime) ; seuls les droits de
+# LECTURE/traversée sont ouverts au non-root : aucun `chown -R` massif des
+# poids, et les fichiers copiés en 0600 restent lisibles par l'application.
+RUN chmod -R a+rX /app /opt/models /opt/docling-models \
  && mkdir -p /data /secrets
 
 ENV WALLIA_FRONTEND_DIR=/app/static \
     WALLIA_MODEL_DIR=/opt/models/e5-small \
+    WALLIA_RERANKER_MODEL_DIR=/opt/models/reranker \
     WALLIA_DOCLING_MODELS=/opt/docling-models \
     WALLIA_DATA_DIR=/data \
     WALLIA_SECRETS_DIR=/secrets

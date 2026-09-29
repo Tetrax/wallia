@@ -127,3 +127,55 @@ def test_conversation_isolation_between_users(client, admin, other_user):
             second.delete(f"/api/conversations/{conversation['id']}", headers={"X-CSRF-Token": csrf2}).status_code
             == 404
         )
+
+
+def test_source_availability_is_resolved_without_renumbering(client, admin):
+    """Citations historiques : excerpt conservé, document disparu marqué
+    indisponible, numéros de source jamais renumérotés."""
+    import uuid
+
+    from sqlalchemy import text
+
+    from app.db import session_scope
+    from app.models import Message
+    from tests.test_jobs import import_document
+
+    csrf = login(client, admin)
+    conversation = _create(client, csrf, "Cas citations")
+    document_id = import_document(client, csrf, title="Guide EN rotation").json()["id"]
+    with session_scope() as db:
+        db.add(
+            Message(
+                conversation_id=uuid.UUID(conversation["id"]),
+                seq=1,
+                role="assistant",
+                content="Réponse sourcée [1].",
+                status="complete",
+                sources=[
+                    {
+                        "index": 1,
+                        "chunk_id": "chunk-1",
+                        "document_id": document_id,
+                        "title": "Guide EN rotation",
+                        "page_start": 2,
+                        "versions": ["10.10"],
+                        "product": "Aster",
+                        "text": "Log rotation keeps seven days of entries.",
+                    }
+                ],
+            )
+        )
+    messages = client.get(f"/api/conversations/{conversation['id']}/messages").json()["messages"]
+    source = messages[0]["sources"][0]
+    assert source["available"] is True
+    assert source["index"] == 1
+
+    with session_scope() as db:
+        db.execute(text("DELETE FROM documents WHERE id = :id"), {"id": document_id})
+
+    messages = client.get(f"/api/conversations/{conversation['id']}/messages").json()["messages"]
+    source = messages[0]["sources"][0]
+    assert source["available"] is False
+    assert source["text"] == "Log rotation keeps seven days of entries."
+    assert source["index"] == 1
+    assert source["page_start"] == 2

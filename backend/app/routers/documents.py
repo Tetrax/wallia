@@ -16,12 +16,12 @@ from sqlalchemy.orm import Session
 
 from ..config import Settings, get_settings
 from ..deps import AuthContext, csrf_guard, require_admin, require_user
-from ..jobs import cancel_queued_jobs_for_document, enqueue_job, job_to_dict, retry_failed_job
+from ..jobs import cancel_queued_jobs_for_document, enqueue_job, has_active_job, job_to_dict, retry_failed_job
 from ..models import Chunk, Document, IngestionJob
 from ..schemas import DocumentPatch, validate_version
 from ..security import sanitize_text
 from ..serializers import document_out
-from .attachments import PDF_MAGIC, sanitize_filename
+from .attachments import PDF_MAGIC, parse_file, read_upload_bounded, sanitize_filename
 
 router = APIRouter(prefix="/api", tags=["documents"])
 
@@ -86,16 +86,26 @@ async def import_document(
     settings = auth.settings
     if not auth.user.is_admin:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="accès administrateur requis")
-    data = await file.read()
+    # Lecture réellement bornée (jamais le corps entier chargé) puis contrôle
+    # du nombre de pages AVANT extraction, hors de la boucle web.
+    try:
+        data = await read_upload_bounded(file, settings.upload_pdf_max_bytes)
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_413_REQUEST_ENTITY_TOO_LARGE:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="PDF trop volumineux (max 20 Mio)"
+            )
+        raise
     if not data or not data.startswith(PDF_MAGIC):
         raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="seuls les PDF sont acceptés pour le corpus")
-    if len(data) > settings.upload_pdf_max_bytes:
-        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="PDF trop volumineux (max 20 Mio)")
 
-    import pypdf
+    import pypdf  # noqa: F401 - conservé pour compatibilité d'import des tests
 
     try:
-        pages = len(pypdf.PdfReader(io.BytesIO(data)).pages)
+        # Analyse dans un sous-processus borné (réellement terminable).
+        pages = int((await parse_file("pdf_pages", data, auth.settings))["pages"])
+    except HTTPException:
+        raise
     except Exception:  # noqa: BLE001
         raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="PDF illisible")
     if pages > settings.upload_pdf_max_pages:
@@ -106,6 +116,12 @@ async def import_document(
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="titre requis")
     if scope not in ("demo", "official"):
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="périmètre invalide")
+    # Cohérence démo/périmètre imposée à l'égalité : demo == (scope == "demo").
+    if bool(demo) != (scope == "demo"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="cohérence démo/périmètre : un document de démonstration est « demo », sinon « official »",
+        )
     try:
         version_list = json.loads(versions) if versions.strip().startswith("[") else [
             v.strip() for v in versions.split(",") if v.strip()
@@ -123,6 +139,12 @@ async def import_document(
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="date invalide (AAAA-MM-JJ)")
 
     checksum = hashlib.sha256(data).hexdigest()
+    # Déduplication sérialisée : deux imports simultanés du même contenu ne
+    # peuvent pas créer deux documents.
+    auth.db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(CAST(:c AS text), 0))"),
+        {"c": f"import:{scope}:{checksum}"},
+    )
     duplicate = auth.db.execute(
         select(Document).where(Document.checksum_sha256 == checksum, Document.scope == scope)
     ).scalar_one_or_none()
@@ -185,6 +207,15 @@ def patch_document(document_id: uuid.UUID, body: DocumentPatch, auth: AuthContex
         ).scalar_one_or_none()
         if duplicate is not None:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="conflit de périmètre avec un document identique")
+    # Cohérence démo/périmètre imposée aussi à la modification, à l'égalité :
+    # demo == (scope == "demo"), dans les deux sens.
+    resulting_demo = bool(data.get("demo", document.demo))
+    resulting_scope = data.get("scope", document.scope)
+    if resulting_demo != (resulting_scope == "demo"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="cohérence démo/périmètre : un document de démonstration est « demo », sinon « official »",
+        )
     for field in ("title", "origin", "product", "language", "document_date", "demo", "scope"):
         if field in data:
             value = data[field]
@@ -207,6 +238,14 @@ def reindex_document(document_id: uuid.UUID, auth: AuthContext = Depends(csrf_gu
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="document introuvable")
     if document.status == "deleting":
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="document en cours de suppression")
+    # Contrôle et insertion sérialisés par verrou transactionnel : deux appels
+    # de réindexation simultanés ne peuvent pas empiler deux jobs.
+    auth.db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(CAST(:c AS text), 0))"),
+        {"c": f"reindex:{document.id}"},
+    )
+    if has_active_job(auth.db, document.id, "ingest") or has_active_job(auth.db, document.id, "reindex"):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="une ingestion est déjà en cours pour ce document")
     job = enqueue_job(auth.db, kind="reindex", document_id=document.id, max_attempts=3)
     auth.db.commit()
     return {"job": job_to_dict(job), "document": document_out(document)}
@@ -226,13 +265,15 @@ def delete_document(document_id: uuid.UUID, auth: AuthContext = Depends(csrf_gua
     chunks_removed = int(
         auth.db.execute(select(func.count(Chunk.id)).where(Chunk.document_id == document.id)).scalar_one()
     )
-    doc_file = settings.documents_dir / document.stored_relpath
+    base = settings.documents_dir.resolve()
+    doc_file = (settings.documents_dir / document.stored_relpath).resolve()
     auth.db.delete(document)  # cascade : messages/chunks/jobs liés au document
     auth.db.commit()
-    try:
-        doc_file.unlink()
-    except OSError:
-        pass
+    if doc_file.is_relative_to(base):
+        try:
+            doc_file.unlink()
+        except OSError:
+            pass
     work_dir = settings.data_dir / "ingestion" / str(document_id)
     if work_dir.is_dir():
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -247,7 +288,8 @@ def download_original(document_id: uuid.UUID, auth: AuthContext = Depends(requir
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="document introuvable")
     base = settings.documents_dir.resolve()
     path = (settings.documents_dir / document.stored_relpath).resolve()
-    if not str(path).startswith(str(base)) or not path.is_file():
+    # Appartenance réelle au répertoire (jamais un simple préfixe de chaîne).
+    if not path.is_relative_to(base) or not path.is_file():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="fichier introuvable")
     return FileResponse(
         path,

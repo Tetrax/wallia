@@ -41,7 +41,32 @@ def conversation_out(conv: Conversation, *, last_message: Message | None = None,
     return payload
 
 
-def message_out(message: Message) -> dict[str, Any]:
+def message_out(message: Message, *, available_document_ids: set[str] | None = None) -> dict[str, Any]:
+    """Sérialise un message ; les citations restent des snapshots numérotés.
+
+    Quand `available_document_ids` est fourni (résolu par l'appelant en une
+    requête), chaque source reçoit `available` : l'excerpt historique est
+    conservé, le document supprimé est marqué indisponible — les numéros de
+    source ne sont JAMAIS renumérotés.
+    """
+    sources = message.sources
+    if sources and available_document_ids is not None:
+        enriched: list[Any] = []
+        for source in sources:
+            if not isinstance(source, dict):
+                enriched.append(source)
+                continue
+            item = dict(source)
+            if item.get("source_type") == "web":
+                # Les sources web n'ont ni document ni identifiant : la
+                # disponibilité corpus ne s'y applique pas (jamais un faux
+                # « document supprimé »).
+                enriched.append(item)
+                continue
+            document_id = item.get("document_id")
+            item["available"] = bool(document_id) and str(document_id) in available_document_ids
+            enriched.append(item)
+        sources = enriched
     return {
         "id": str(message.id),
         "conversation_id": str(message.conversation_id),
@@ -52,7 +77,7 @@ def message_out(message: Message) -> dict[str, Any]:
         "error": message.error,
         "model": message.model,
         "demo": message.demo,
-        "sources": message.sources,
+        "sources": sources,
         "created_at": _iso(message.created_at),
         "updated_at": _iso(message.updated_at),
     }

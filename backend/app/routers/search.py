@@ -1,11 +1,8 @@
 """Recherche documentaire exposée (indépendante du chat)."""
 from __future__ import annotations
 
-import dataclasses
-
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from ..app_settings import retrieval_config
 from ..deps import AuthContext, require_user
 from ..embeddings import EmbeddingsUnavailable, get_embedding_service
 from ..retrieval import hybrid_search
@@ -17,7 +14,6 @@ router = APIRouter(prefix="/api", tags=["search"])
 @router.post("/search")
 def search(body: SearchIn, auth: AuthContext = Depends(require_user)):
     settings = auth.settings
-    config = retrieval_config(auth.db, settings)
     try:
         vector = get_embedding_service().encode([body.query.strip()], kind="query")[0]
     except EmbeddingsUnavailable as exc:
@@ -25,10 +21,9 @@ def search(body: SearchIn, auth: AuthContext = Depends(require_user)):
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"service d'embeddings indisponible: {exc}",
         )
-    effective = dataclasses.replace(settings, retrieval_min_cosine=float(config["min_cosine"]))
     result = hybrid_search(
         auth.db,
-        effective,
+        settings,
         query=body.query.strip(),
         query_vector=vector,
         product=body.product,

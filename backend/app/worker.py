@@ -2,6 +2,12 @@
 
 Un seul job documentaire simultané. Survit à une conversion invalide :
 Docling tourne dans un sous-processus borné (timeout, limites locales).
+
+Durabilité : le bail (lease) est renouvelé pendant tout le traitement par un
+fil dédié (battement compris) ; le délai total du job est borné ; la propriété
+du bail est revérifiée avant la publication et avant la clôture. Un worker qui
+a perdu son bail ne public JAMAIS (l'ancienne génération éventuelle reste
+servie, la reprise reprend le job).
 """
 from __future__ import annotations
 
@@ -11,6 +17,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -20,7 +27,7 @@ from sqlalchemy.orm import Session
 
 from . import chunking
 from .config import Settings, get_settings
-from .db import session_scope
+from .db import get_engine, session_scope
 from .jobs import (
     claim_job,
     enqueue_job,
@@ -38,9 +45,55 @@ log = logging.getLogger("wallia.worker")
 
 WORKER_ID = f"{socket.gethostname()}"
 
+# Verrou consultatif de SESSION : un seul worker traite la file documentaire.
+WORKER_SESSION_LOCK_KEY = 20260928
+
 
 class JobAbort(RuntimeError):
-    """Échec non réessayable (document supprimé, entrée invalide)."""
+    """Échec non réessayable (document supprimé, entrée invalide, bail perdu)."""
+
+
+def safe_error_text(error: object) -> str:
+    """Message d'erreur stockable : jamais de paramètres SQL ni de dump brut.
+
+    Les erreurs SQLAlchemy incluent souvent les paramètres liés (contenu
+    utilisateur) dans leur rendu : on ne conserve que la classe d'erreur.
+    """
+    import sqlalchemy.exc
+
+    if isinstance(error, sqlalchemy.exc.SQLAlchemyError):
+        return f"{error.__class__.__name__} (détail SQL masqué)"
+    text_value = " ".join(str(error).split())
+    return text_value[:300]
+
+
+class _LeaseKeeper(threading.Thread):
+    """Renouvelle le bail et le battement pendant le traitement d'un job."""
+
+    def __init__(self, worker: "Worker", job_id, lease_seconds: int) -> None:
+        super().__init__(daemon=True, name=f"wallia-lease-{job_id}")
+        self.worker = worker
+        self.job_id = job_id
+        self.lease_seconds = lease_seconds
+        self.interval = max(2.0, lease_seconds / 3.0)
+        self.lost = False
+        self._done = threading.Event()
+
+    def run(self) -> None:
+        while not self._done.wait(self.interval):
+            try:
+                with session_scope() as db:
+                    if not renew_lease(db, self.job_id, self.worker.worker_id, self.lease_seconds):
+                        self.lost = True
+                        return
+                    self.worker.heartbeat(db, phase="running", job_id=str(self.job_id))
+            except Exception as exc:  # noqa: BLE001 - base momentanément indisponible
+                log.warning("renouvellement de bail différé: %s", exc.__class__.__name__)
+
+    def stop(self) -> None:
+        self._done.set()
+        if self.is_alive():
+            self.join(timeout=2)
 
 
 class Worker:
@@ -73,14 +126,30 @@ class Worker:
         return self._token_counter
 
     # -- embeddings via l'API (une seule copie du modèle) ------------------
-    def embed_texts(self, texts: list[str], kind: str) -> list[list[float]]:
+    def embed_texts(self, texts: list[str], kind: str, deadline: float | None = None) -> list[list[float]]:
+        """Embeddings par l'API interne, bornés par le délai RESTANT du job.
+
+        Chaque tentative et chaque backoff consomment au plus le temps restant :
+        un job presque terminé n'attend jamais 3 × 300 s.
+        """
         url = os.environ.get("WALLIA_API_BASE_URL", "http://api:8000").rstrip("/") + "/internal/embeddings"
         payload = {"kind": kind, "texts": texts}
         headers = {"X-Internal-Token": self.settings.worker_token()}
         last_error: Exception | None = None
         for attempt in range(3):
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 1.0:
+                raise RuntimeError("service d'embeddings indisponible: délai total du job épuisé")
+            read_timeout = 300.0 if remaining is None else max(1.0, min(300.0, remaining))
             try:
-                with httpx.Client(timeout=httpx.Timeout(connect=10.0, read=300.0, write=60.0, pool=10.0)) as client:
+                with httpx.Client(
+                    timeout=httpx.Timeout(
+                        connect=min(10.0, read_timeout),
+                        read=read_timeout,
+                        write=min(60.0, read_timeout),
+                        pool=min(10.0, read_timeout),
+                    )
+                ) as client:
                     response = client.post(url, json=payload, headers=headers)
                 if response.status_code == 200:
                     data = response.json()
@@ -91,11 +160,17 @@ class Worker:
                 raise RuntimeError(f"embeddings HTTP {response.status_code}")
             except Exception as exc:  # noqa: BLE001 - reprise bornée
                 last_error = exc
-                time.sleep(2 * (attempt + 1))
-        raise RuntimeError(f"service d'embeddings indisponible: {last_error}")
+                backoff = 2.0 * (attempt + 1)
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= backoff + 1.0:
+                        break  # plus de temps utile pour une nouvelle tentative
+                    backoff = min(backoff, remaining - 1.0)
+                time.sleep(backoff)
+        raise RuntimeError(f"service d'embeddings indisponible: {last_error.__class__.__name__ if last_error else 'inconnu'}")
 
     # -- extraction --------------------------------------------------------
-    def run_docling(self, input_path: Path, work_dir: Path) -> dict:
+    def run_docling(self, input_path: Path, work_dir: Path, timeout_seconds: float | None = None) -> dict:
         work_dir.mkdir(parents=True, exist_ok=True)
         env = dict(os.environ)
         env.update(
@@ -123,6 +198,7 @@ class Worker:
             "--models",
             str(self.settings.docling_models_dir),
         ]
+        timeout = timeout_seconds if timeout_seconds is not None else float(self.settings.worker_docling_timeout_seconds)
         started = time.monotonic()
         proc = subprocess.run(
             cmd,
@@ -130,14 +206,15 @@ class Worker:
             env=env,
             capture_output=True,
             text=True,
-            timeout=self.settings.worker_docling_timeout_seconds,
+            timeout=max(1.0, timeout),
         )
         took = time.monotonic() - started
         (work_dir / "docling_stdout.log").write_text(proc.stdout or "", encoding="utf-8")
         (work_dir / "docling_stderr.log").write_text(proc.stderr or "", encoding="utf-8")
         if proc.returncode != 0:
-            tail = " ".join((proc.stderr or "").strip().splitlines()[-3:])[:400]
-            raise JobAbort(f"extraction Docling échouée (code {proc.returncode}): {tail}")
+            # Aucun stderr brut exposé : le détail reste dans les journaux locaux
+            # du dossier de travail, jamais dans l'erreur publique du job.
+            raise JobAbort(f"extraction Docling échouée (code {proc.returncode})")
         try:
             summary = json.loads((proc.stdout or "").strip().splitlines()[-1])
         except (ValueError, IndexError):
@@ -147,7 +224,18 @@ class Worker:
         return summary
 
     # -- job principal -----------------------------------------------------
-    def handle_ingest(self, db: Session, job) -> None:
+    def handle_ingest(self, db: Session, job, keeper: _LeaseKeeper, job_deadline: float) -> None:
+        def ensure_lease() -> None:
+            """Propriété du bail vérifiée de façon synchrone (et délai total)."""
+            if keeper.lost:
+                raise JobAbort("bail perdu — publication annulée, reprise par un autre worker")
+            if time.monotonic() > job_deadline:
+                raise JobAbort(f"délai total du job dépassé ({self.settings.worker_job_timeout_seconds}s)")
+            with session_scope() as lease_db:
+                if not renew_lease(lease_db, job.id, self.worker_id, self.settings.worker_lease_seconds):
+                    keeper.lost = True
+                    raise JobAbort("bail perdu — publication annulée, reprise par un autre worker")
+
         document = db.get(Document, job.document_id)
         if document is None:
             raise JobAbort("document supprimé")
@@ -160,12 +248,15 @@ class Worker:
         generation = document.current_generation + 1
         work_dir = self.settings.data_dir / "ingestion" / str(document.id) / f"gen{generation}"
 
-        set_progress(db, job.id, {"stage": "extraction_docling", "generation": generation})
+        set_progress(db, job.id, {"stage": "extraction_docling", "generation": generation}, worker_id=self.worker_id)
         # Réindexation : l'ancienne génération reste servie pendant le traitement.
         document.status = "processing" if document.current_generation == 0 else "ready"
         db.commit()
+        ensure_lease()
 
-        summary = self.run_docling(doc_path, work_dir)
+        remaining = max(1.0, job_deadline - time.monotonic())
+        summary = self.run_docling(doc_path, work_dir, timeout_seconds=min(float(self.settings.worker_docling_timeout_seconds), remaining))
+        ensure_lease()
 
         extracted_path = work_dir / "extracted.json"
         if not extracted_path.is_file():
@@ -175,25 +266,29 @@ class Worker:
         if not items:
             raise JobAbort("aucun contenu exploitable extrait du document")
 
-        set_progress(db, job.id, {"stage": "chunking", "items": len(items), "generation": generation})
+        set_progress(db, job.id, {"stage": "chunking", "items": len(items), "generation": generation}, worker_id=self.worker_id)
         counter = self.token_counter()
         chunks = chunking.chunk_items(items, counter)
         if not chunks:
             raise JobAbort("aucun passage généré")
-        set_progress(db, job.id, {"stage": "embeddings", "chunks": len(chunks), "done": 0})
+        set_progress(db, job.id, {"stage": "embeddings", "chunks": len(chunks), "done": 0}, worker_id=self.worker_id)
 
         vectors: list[list[float]] = []
         batch = self.settings.embedding_batch_size
         for start in range(0, len(chunks), batch):
             window = chunks[start : start + batch]
-            vectors.extend(self.embed_texts([c["text"] for c in window], kind="passage"))
+            vectors.extend(self.embed_texts([c["text"] for c in window], kind="passage", deadline=job_deadline))
             set_progress(
                 db,
                 job.id,
                 {"stage": "embeddings", "chunks": len(chunks), "done": len(vectors)},
+                worker_id=self.worker_id,
             )
+            ensure_lease()
 
-        set_progress(db, job.id, {"stage": "publication", "chunks": len(chunks)})
+        # Publication : propriété du bail exigée JUSTE AVANT l'insertion.
+        ensure_lease()
+        set_progress(db, job.id, {"stage": "publication", "chunks": len(chunks)}, worker_id=self.worker_id)
         # Publication atomique : nouvelle génération insérée puis basculée ;
         # l'ancienne génération n'est supprimée qu'en cas de succès.
         db.execute(
@@ -235,49 +330,114 @@ class Worker:
             text("DELETE FROM chunks WHERE document_id = :doc AND generation < :gen"),
             {"doc": str(document.id), "gen": generation},
         )
+        # FENCE DE PROPRIÉTÉ ATOMIQUE : la propriété (locked_by, statut, bail
+        # ENCORE valide) est revérifiée DANS la transaction de publication,
+        # sous verrou de ligne — jamais dans une transaction séparée.
+        fence = db.execute(
+            text("SELECT locked_by, status, lease_until FROM ingestion_jobs WHERE id = :id FOR UPDATE"),
+            {"id": str(job.id)},
+        ).fetchone()
+        if (
+            fence is None
+            or fence[0] != self.worker_id
+            or fence[1] != "running"
+            or fence[2] is None
+            or fence[2] <= utcnow()
+        ):
+            raise JobAbort("bail perdu — publication annulée, reprise par un autre worker")
         db.commit()
         log.info("document %s publié (génération %s, %s passages)", document.id, generation, len(chunks))
 
+    def _processing_lock(self):
+        """Verrou consultatif de SESSION sur une connexion dédiée.
+
+        Un seul worker traite la file documentaire : si un autre worker le
+        détient, `run_once` ne réclame rien. La connexion est fermée (ou
+        invalidée) à la libération, donc le verrou ne survit jamais à un crash.
+        """
+        conn = get_engine().connect()
+        try:
+            acquired = bool(
+                conn.execute(text("SELECT pg_try_advisory_lock(:key)"), {"key": WORKER_SESSION_LOCK_KEY}).scalar()
+            )
+        except Exception:
+            conn.close()
+            raise
+        if not acquired:
+            conn.close()
+            return None
+        return conn
+
+    @staticmethod
+    def _release_processing_lock(conn) -> None:
+        try:
+            conn.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": WORKER_SESSION_LOCK_KEY})
+            conn.commit()
+            conn.close()
+        except Exception:
+            # Invalidation : la coupure réelle de la connexion libère le verrou.
+            conn.invalidate()
+
     def run_once(self) -> bool:
+        lock_conn = self._processing_lock()
+        if lock_conn is None:
+            return False
+        try:
+            return self._run_once_locked()
+        finally:
+            self._release_processing_lock(lock_conn)
+
+    def _run_once_locked(self) -> bool:
         with session_scope() as db:
             job = claim_job(db, self.worker_id, self.settings.worker_lease_seconds)
             if job is None:
                 return False
             job_id = job.id
+            job_deadline = time.monotonic() + float(self.settings.worker_job_timeout_seconds)
+            keeper = _LeaseKeeper(self, job_id, self.settings.worker_lease_seconds)
             log.info("job %s (%s) démarré", job_id, job.kind)
             try:
                 self.heartbeat(db, phase="running", job_id=str(job_id))
+                keeper.start()
                 if job.kind in ("ingest", "reindex"):
-                    self.handle_ingest(db, job)
+                    self.handle_ingest(db, job, keeper, job_deadline)
                 else:
                     raise JobAbort(f"type de job inconnu: {job.kind}")
             except JobAbort as exc:
                 log.warning("job %s abandonné: %s", job_id, exc)
                 try:
                     db.rollback()
-                    finish_failure(db, job_id, str(exc), retryable=False)
-                    self._mark_document_failed(db, job_id, str(exc))
+                    status = finish_failure(db, job_id, safe_error_text(exc), retryable=False, worker_id=self.worker_id)
+                    if status != "gone":
+                        self._mark_document_failed(db, job_id, safe_error_text(exc))
                 except Exception as inner:  # noqa: BLE001
-                    log.error("échec de clôture du job %s: %s", job_id, inner)
+                    log.error("échec de clôture du job %s: %s", job_id, inner.__class__.__name__)
                 return True
             except subprocess.TimeoutExpired:
                 db.rollback()
-                finish_failure(db, job_id, "délai d'extraction dépassé", retryable=True)
-                self._mark_document_failed(db, job_id, "délai d'extraction dépassé")
+                status = finish_failure(db, job_id, "délai d'extraction dépassé", retryable=True, worker_id=self.worker_id)
+                if status != "gone":
+                    self._mark_document_failed(db, job_id, "délai d'extraction dépassé")
                 return True
             except Exception as exc:  # noqa: BLE001 - le worker doit survivre
-                log.exception("job %s en erreur", job_id)
+                # Jamais de traceback : il pourrait écho des paramètres SQL ou du
+                # contenu utilisateur. Seule la classe d'erreur est journalisée.
+                log.error("job %s en erreur (%s)", job_id, exc.__class__.__name__)
                 try:
                     db.rollback()
-                    finish_failure(db, job_id, f"{exc.__class__.__name__}: {exc}", retryable=True)
-                    self._mark_document_failed(db, job_id, str(exc))
+                    status = finish_failure(db, job_id, safe_error_text(exc), retryable=True, worker_id=self.worker_id)
+                    if status != "gone":
+                        self._mark_document_failed(db, job_id, safe_error_text(exc))
                 except Exception as inner:  # noqa: BLE001
-                    log.error("échec de clôture du job %s: %s", job_id, inner)
+                    log.error("échec de clôture du job %s: %s", job_id, inner.__class__.__name__)
                 return True
+            finally:
+                keeper.stop()
             try:
-                finish_success(db, job_id)
+                if not finish_success(db, job_id, worker_id=self.worker_id):
+                    log.warning("job %s non clôturé en succès (bail perdu)", job_id)
             except Exception as exc:  # noqa: BLE001
-                log.error("fin de job %s non persistée: %s", job_id, exc)
+                log.error("fin de job %s non persistée: %s", job_id, exc.__class__.__name__)
             return True
 
     def _mark_document_failed(self, db: Session, job_id, error: str) -> None:
@@ -290,7 +450,7 @@ class Worker:
         document = db.get(Document, row[0])
         if document is None or document.status == "deleting":
             return
-        safe = " ".join(str(error).split())[:500]
+        safe = safe_error_text(error)
         if document.current_generation > 0:
             document.status = "ready"  # l'indexation précédente reste servie
             document.error = f"dernière réindexation échouée: {safe}"
@@ -319,7 +479,7 @@ class Worker:
                 log.info("arrêt demandé")
                 return
             except Exception as exc:  # noqa: BLE001
-                log.error("boucle worker: %s", exc)
+                log.error("boucle worker: %s", exc.__class__.__name__)
                 time.sleep(5)
 
 

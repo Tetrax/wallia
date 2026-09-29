@@ -38,8 +38,14 @@ def build_converter(models_dir: Path | None):
     from docling.document_converter import DocumentConverter, PdfFormatOption
 
     options = PdfPipelineOptions()
+    # Options EXPLICITES : OCR désactivé, structure de tableaux activée
+    # (tableformer), enrichissements (code, formules, classification d'images)
+    # DÉSACTIVÉS — aucun modèle superflu, aucun défaut silencieux du pipeline.
     options.do_ocr = False
     options.do_table_structure = True
+    options.do_code_enrichment = False
+    options.do_formula_enrichment = False
+    options.do_picture_classification = False
     options.accelerator_options = AcceleratorOptions(num_threads=2, device=AcceleratorDevice.CPU)
     if models_dir is not None and models_dir.is_dir() and any(models_dir.iterdir()):
         options.artifacts_path = models_dir

@@ -29,7 +29,30 @@ scripts/down.sh                  # arrêt ; --purge pour supprimer aussi les vol
 ```
 
 `scripts/build.sh --deliver` et `scripts/deploy.sh` refusent un arbre sale ou un
-HEAD non poussé : c'est le mode livraison. Le mode test local est explicite.
+HEAD non poussé (vérification EN LIGNE) : c'est le mode livraison, toujours sur
+le HEAD courant — aucune sélection de SHA arbitraire (le retour vers un état
+ancien passe UNIQUEMENT par `scripts/rollback.sh`). Le déploiement contrôle
+l'environnement Compose EFFECTIF (rendu, variables héritées incluses), exige la
+santé `healthy` de db/api/worker et enregistre l'état précédent (voir §12).
+
+## 2 bis. Modèles embarqués (vérification hors réseau)
+
+```bash
+docker run --rm --network none \
+  --memory 2500m --cpus 2 --read-only --tmpfs /tmp:size=768m --cap-drop ALL \
+  --entrypoint python wallia:<sha> -m app.cli check-models
+```
+
+`check-models` vérifie les manifestes (fichiers/tailles/empreintes, identité et
+révision attendues) puis exécute SÉQUENTIELLEMENT trois sondes réelles — E5,
+reclassement, Docling (2 pages avec tableau) — chacune dans son processus :
+les modèles ne sont jamais chargés simultanément. Un échec — y compris un
+DÉPASSEMENT DE DÉLAI d'une sonde, rapporté explicitement en résultat non-ok
+(jamais une traceback à interpréter) — rend l'image non conforme (le build
+`--deliver` l'exécute automatiquement). Les manifestes exigent les fichiers
+ESSENTIELS de chaque modèle (alignés sur `scripts/fetch_models.py`), des
+chemins relatifs sûrs (ni `../`, ni absolu, ni cache) et l'identité, la
+révision et la licence attendues.
 
 ## 3. Secrets et configuration
 
@@ -114,12 +137,68 @@ HEAD non poussé : c'est le mode livraison. Le mode test local est explicite.
 ## 10. Sauvegarde, restauration
 
 ```bash
-scripts/backup.sh                                  # dump SQL.gz + données + SHA-256
-scripts/restore.sh --isolated runtime/backups/wallia-db-<stamp>.sql.gz   # test jetable
-scripts/restore.sh --inplace  runtime/backups/wallia-db-<stamp>.sql.gz --yes
+scripts/backup.sh                       # bundle cohérent (DB + fichiers + manifeste), pause brève api/worker
+scripts/restore.sh --isolated <bundle>  # recette isolée : cible neuve, base jetable sans port, vérifications complètes
 ```
 
-Les sauvegardes ne contiennent pas les secrets (à sauvegarder séparément).
+**Sauvegarde.** Le runtime sauvegardé est le SNAPSHOT COURANT VALIDÉ
+(`runtime/deploy-state/current.json`) ; sans état suivi (runtime historique),
+`--env-file <fichier réel>` devient EXPLICITE obligatoire — jamais de repli
+implicite vers `runtime/secrets/app.env`. La découverte des services
+(`docker compose ps`) et la vérification réelle de l'arrêt sont FATALES en cas
+d'échec (une panne n'est jamais « zéro service ») : aucune sauvegarde à chaud.
+Seuls api/worker INITIALEMENT actifs sont arrêtés (la base reste active ; le
+trap de reprise est armé AVANT l'arrêt et reprend exactement ces services,
+même sur échec partiel). Archive, comptes des 8 tables (erreurs SQL fatales,
+`ON_ERROR_STOP`), références DB→fichiers et manifeste (SHA256) sont calculés
+PENDANT la pause ; le bundle passe les validations EXISTANTES `restore_lib`
+(manifeste strict, SHA256 des archives, sûreté tar : liens/absolus refusés) et
+une référence DB sans fichier rend la sauvegarde NON valide (code de sortie
+non nul AVEC reprise des services). La reprise exige la santé `healthy` de
+api+worker et un échec de reprise donne un code de sortie NON NUL. Le répertoire
+du bundle est créé SANS écrasement possible (même dans la même seconde).
+
+Bundle sous `runtime/backups/` (répertoire 0700, fichiers 0600) : il ne
+contient **aucun secret** (les clés externes — `runtime/secrets/` — doivent
+être sauvegardées séparément), mais la base embarque les empreintes de
+comptes/sessions et les données applicatives (conversations, pièces jointes,
+documents) : **ce n'est PAS un export publiable ni totalement dépourvu
+d'information sensible** — à protéger comme les données de production. Aucun
+contenu utilisateur n'est imprimé.
+
+**Restauration isolée** (`--isolated`, seule exécution automatisée en V1).
+Cible NEUVE garantie (`runtime/restore-isolated/<stamp>-<aléa>`), conteneur
+`wallia-restore-<stamp>-<aléa>` : réseau none, aucun port publié, 512 Mo / 1
+CPU, données PostgreSQL dans un volume dédié (jamais un tmpfs). Vérifications :
+manifeste STRICT (exactement les 8 tables attendues, types entiers, chemins
+canoniques sans traversée), SHA256 des archives AVANT tout parsing, erreurs
+SQL fatales (`ON_ERROR_STOP`), fichiers manquants/extra/altérés/liens,
+références DB→fichiers. **Aucun nettoyage automatique** : conteneur, volume et
+cible sont conservés comme preuve et l'opérateur nettoie explicitement
+(commandes affichées à la fin). Les sorties de vérification
+(`verification/table-counts.txt`, `verification/db-file-refs.txt`) sont
+privées et CONSERVÉES sous la cible isolée.
+
+**Restauration EN PLACE — procédure opérateur CONTRÔLÉE** (retirée du script ;
+jamais dans la recette de livraison) :
+
+1. sauvegarde fraîche obligatoire : `scripts/backup.sh` (c'est le retour
+   arrière) ; noter l'image courante (`runtime/deploy-state/current.json`) ;
+2. valider le bundle : `python3 scripts/restore_lib.py validate <bundle>` ;
+3. `docker compose -p wallia stop api worker` puis vérifier l'arrêt ;
+4. base : `gunzip -c <bundle>/db.sql.gz | docker compose -p wallia exec -T db psql -v ON_ERROR_STOP=1 -U wallia -d wallia -q`;
+5. fichiers : extraire vers un répertoire NEUF puis contrôler avant substitution
+   (`python3 scripts/restore_lib.py extract <bundle> <neuf>`, `verify-files`,
+   `verify-refs` avec les références DB restaurées) ; remplacer `runtime/data`
+   en conservant l'ancien au moins jusqu'aux smoke tests ;
+6. migrations puis reprise : `docker compose -p wallia run --rm api python -m app.migrate`,
+   `docker compose -p wallia up -d api worker`, `scripts/smoke.sh`.
+
+**Migrations ascendantes uniquement** : il n'existe aucune migration
+descendante. Après une restauration (isolée ou en place), rejouer
+`app.migrate` sur la base restaurée ; si un retour d'image est nécessaire avec
+une base déjà migrée par une version incompatible, restaurer d'abord la
+sauvegarde correspondante, puis `scripts/rollback.sh`.
 
 ## 11. Limites connues du prototype
 
@@ -130,3 +209,45 @@ Les sauvegardes ne contiennent pas les secrets (à sauvegarder séparément).
   absent) plutôt que des passages de substitution.
 - Nginx/TLS : fichiers préparés dans `deployment/`, application par le principal.
 - Le smoke/acceptance suppose la pile démarrée localement (`dev_up.sh`).
+
+## 12. Déploiement, état et retour arrière
+
+- `scripts/build.sh --deliver` : arbre propre + HEAD réellement présent sur
+  origin (en ligne) ; image `wallia:<sha complet>` (label OCI ET variable
+  embarquée `WALLIA_GIT_SHA` concordants) ; sonde modèles bornée (2500 Mo,
+  2 CPU, tmpfs borné, lecture seule, caps abandonnées) hors réseau. Les tags
+  de test (`wallia:test-*`, `wallia:local`) ne peuvent jamais usurper le SHA
+  livré.
+- `scripts/deploy.sh --env-file <env-production>` : contrôle STRICT de
+  l'environnement Compose EFFECTIF (production, cookie secure, origine exacte,
+  endpoint natif HTTPS, aucun backend de test — fichier ET variables héritées,
+  jamais un `grep` de fichier) ; image par SHA complet, ID immuable résolu UNE
+  fois ; snapshot Compose RENDU (JSON auto-contenu) référençant cet ID, produit
+  et vérifié AVANT up/migrate, puis utilisé pour TOUTES les mutations ;
+  démarrage db/api/worker du projet `wallia` uniquement ; santé `healthy`
+  OBLIGATOIRE des trois services et image EFFECTIVE d'api/worker vérifiée
+  après démarrage ; aucun remove-orphans.
+- État de déploiement : `runtime/deploy-state/` (0700, fichiers 0600) —
+  `current.json` (image, image ID immuable `sha256:…`, snapshot Compose RENDU,
+  fichier d'environnement) ; écritures ATOMIQUES (temporaire + rename).
+- Première transition depuis un runtime Wallia existant sans état suivi :
+  `--bootstrap-previous-env` est RETIRÉE — un déploiement sur un runtime
+  existant SANS `current.json` valide est REFUSÉ avant toute mutation (la
+  capture automatique d'un conteneur arbitraire ne serait pas un rollback
+  fidèle : anciens mounts/env perdus). Le principal prépare et VÉRIFIE
+  manuellement un snapshot fidèle de la configuration réellement active
+  (image ID effectif `docker inspect`, Compose rendu, env), l'installe comme
+  `current.json` puis déploie. Première installation réellement vide :
+  `previous=null`, rollback explicitement impossible. Jamais d'état fabriqué.
+- `scripts/rollback.sh` : rejoue UNIQUEMENT le snapshot précédent (Compose
+  rendu JSON + env + image ID immuable), échoue AVANT toute mutation si l'état
+  est absent/invalide OU si le snapshot ne RÉFÉRENCE PAS l'ID immuable attendu
+  pour api/worker (jamais une autre image ni un tag mutable « parce que l'ID
+  existe »), exige `healthy`, vérifie l'image effective d'api/worker, puis
+  actualise `current.json` (env/mounts du snapshot conservés) et consomme
+  l'état précédent.
+- TLS : trois phases explicites (HTTP ACME → paire LE RÉELLEMENT SERVIE →
+  paire gérée + vhost final) via `deployment/wallia-tls-activate.sh`, modèles
+  root-owned sous `/etc/wallia/tls-templates` installés par l'opérateur (voir
+  `deployment/README.md`) ; bascule atomique du lien `active` ; hook de
+  renouvellement no-op hors lignée Wallia, sans reprise du verrou infra.

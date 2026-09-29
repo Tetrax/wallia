@@ -1,0 +1,138 @@
+# Wallia — runtime UI de recette ISOLÉ (lot4). Projet compose dédié `wallia-e2e`.
+#
+# Recette navigateur locale sur le prototype EXISTANT : API servie en loopback
+# (127.0.0.1:13746) avec le front actuel (frontend/dist), base de TEST dédiée
+# (celle du harnais lot3, via le réseau `wallia_tests_net`), secrets de TEST
+# générés dans `runtime/e2e-isolated/` (jamais runtime/secrets), données de
+# recette dans `runtime/e2e-isolated/data`.
+#
+# Doubles EXPLICITEMENT étiquetés pour cette recette de mécanique UI :
+#   - embeddings `fixture` (pas de modèle E5) ;
+#   - reranker `fixture` (pas de cross-encoder) ;
+#   - fournisseur local `fake-upstream` (pas de provider natif payant).
+# Ces doubles ne remplacent ni la recette native HTTPS finale ni le RAG réel
+# (déjà rejoué séparément par le principal).
+#
+# Aucun port public : uniquement 127.0.0.1. Ne monte ni /secrets ni /data du
+# runtime de livraison, aucun répertoire Hermes.
+
+name: wallia-e2e
+
+x-e2e-env: &e2e-env
+  WALLIA_ENV: local
+  WALLIA_APP_VERSION: 0.1.0
+  WALLIA_SECRETS_DIR: /secrets
+  WALLIA_DATA_DIR: /data
+  WALLIA_FRONTEND_DIR: /data/static
+  WALLIA_DB_HOST: db
+  WALLIA_DB_PORT: "5432"
+  WALLIA_DB_NAME: wallia
+  WALLIA_DB_USER: wallia
+  WALLIA_DB_PASSWORD_FILE: /secrets/db_password
+  WALLIA_EMBEDDING_BACKEND: fixture
+  WALLIA_RERANKER_BACKEND: fixture
+  WALLIA_ALLOWED_ORIGINS: http://127.0.0.1:13746
+  WALLIA_COOKIE_SECURE: "0"
+  WALLIA_TRUSTED_PROXY_CIDRS: 127.0.0.1/32,::1/128,172.16.0.0/12
+  WALLIA_PROVIDER_ALLOWED_DOMAINS: fake-upstream
+  WALLIA_PROVIDER_ENDPOINT: http://fake-upstream:8099/v1
+  WALLIA_PROVIDER_MODEL: fake-model
+  WALLIA_PROVIDER_TIMEOUT_SECONDS: "60"
+  WALLIA_CHAT_MAX_SECONDS: "120"
+  WALLIA_VISION_ENABLED: "0"
+  WALLIA_WEB_ENABLED: "0"
+  WALLIA_TORCH_THREADS: "1"
+  PYTHONPATH: /app
+  PYTHONDONTWRITEBYTECODE: "1"
+  PYTHONUNBUFFERED: "1"
+  HOME: /tmp
+
+services:
+  fake-upstream:
+    image: ${WALLIA_IMAGE:-wallia:local}
+    restart: "no"
+    command:
+      - python
+      - -m
+      - uvicorn
+      - tests.fake_upstream:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8099"
+      - --log-level
+      - warning
+    environment:
+      PYTHONPATH: /app
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./backend:/app:ro
+    healthcheck:
+      disable: true  # l'image embarque un healthcheck API ; ce service n'est pas l'API
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    cpus: 0.5
+    networks: [e2e]
+
+  api:
+    image: ${WALLIA_IMAGE:-wallia:local}
+    restart: "no"
+    environment:
+      <<: *e2e-env
+    volumes:
+      - ./backend:/app:ro
+      - ./resources:/app/resources:ro
+      - ./fixtures:/app/fixtures:ro
+      # Le front actuel est servi depuis /data/static (le point de montage
+      # /app/static est impossible : /app est un bind en lecture seule).
+      - ./frontend/dist:/data/static:ro
+      - ./runtime/e2e-isolated/data:/data
+      # RW (lot4b) : l'API doit POUVOIR persister la clé fournisseur (scénario
+      # recette « clé write-only ») — en RO, PUT /api/settings répond 500
+      # (« Read-only file system »), constaté au probe lot4b.
+      - ./runtime/e2e-isolated/secrets:/secrets:rw
+    ports:
+      - "127.0.0.1:13746:8000"
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 900m
+    cpus: 2.0
+    depends_on:
+      fake-upstream:
+        condition: service_started
+    networks: [e2e]
+
+  # Un coup : migrations + compte de recette + corpus de démonstration recette.
+  # Usage : docker compose -p wallia-e2e -f docker-compose.e2e-isolated.yml run --rm seed
+  seed:
+    image: ${WALLIA_IMAGE:-wallia:local}
+    profiles: ["tools"]
+    command: ["python", "tests/acceptance/e2e_seed.py"]
+    environment:
+      <<: *e2e-env
+    volumes:
+      - ./backend:/app:ro
+      - ./resources:/app/resources:ro
+      - ./runtime/e2e-isolated/data:/data
+      - ./runtime/e2e-isolated/secrets:/secrets
+      - ./runtime/e2e-isolated/credentials.json:/run/e2e/credentials.json:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 512m
+    cpus: 1.0
+    networks: [e2e]
+
+networks:
+  e2e:
+    name: wallia_tests_net
+    external: true

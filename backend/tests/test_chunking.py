@@ -71,3 +71,34 @@ def test_headers_footers_are_skipped():
 def test_empty_items_yield_no_chunks():
     assert chunk_items([], count) == []
     assert chunk_items([{"kind": "text", "label": "paragraph", "text": "   ", "page_no": 1}], count) == []
+
+
+def test_oversized_table_header_is_bounded_and_nothing_is_lost():
+    """En-tête de tableau plus long que la fenêtre : borné, répété seulement si
+    possible, et AUCUN passage au-dessus de la fenêtre — sans perte de contenu."""
+    header_cells = " ".join(f"entete{i}" for i in range(400))
+    header = f"| {header_cells} |\n| --- |"
+    rows = "\n".join(f"| ligne {index} valeur |" for index in range(4))
+    chunks = chunk_items(
+        [{"kind": "table", "label": "table", "text": header + "\n" + rows, "page_no": 3}],
+        approx_token_counter,
+        max_tokens=120,
+    )
+    assert chunks
+    for chunk in chunks:
+        assert approx_token_counter(chunk["text"]) <= 120
+    joined = "".join(chunk["text"] for chunk in chunks)
+    for token in header_cells.split():
+        assert token in joined, f"contenu d'en-tête perdu: {token}"
+    for index in range(4):
+        assert f"ligne {index} valeur" in joined
+    assert all(chunk["page_start"] == 3 for chunk in chunks)
+
+
+def test_single_oversized_word_is_split_without_loss_and_bounded():
+    word = "z" * 6000
+    chunks = chunk_items([{"kind": "text", "label": "paragraph", "text": word, "page_no": 2}], approx_token_counter, max_tokens=100)
+    assert chunks
+    for chunk in chunks:
+        assert approx_token_counter(chunk["text"]) <= 100
+    assert "".join(chunk["text"] for chunk in chunks).replace("\n", "") == word

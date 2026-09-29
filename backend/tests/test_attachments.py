@@ -99,6 +99,43 @@ def test_pdf_attachment_and_unsupported_types(client, admin):
     assert html.status_code == 415
 
 
+def test_oversize_stream_is_rejected(client, admin):
+    csrf = login(client, admin)
+    conversation = client.post("/api/conversations", json={}, headers={"X-CSRF-Token": csrf})
+    conversation_id = conversation.json()["id"]
+    oversize = b"%PDF-" + b"0" * (21 * 1024 * 1024)
+    response = client.post(
+        f"/api/conversations/{conversation_id}/attachments",
+        files={"file": ("enorme.pdf", oversize, "application/pdf")},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert response.status_code == 413
+    assert "volumineux" in response.json()["detail"]
+
+
+def test_pdf_page_count_is_checked_before_extraction(client, admin):
+    csrf = login(client, admin)
+    conversation = client.post("/api/conversations", json={}, headers={"X-CSRF-Token": csrf})
+    conversation_id = conversation.json()["id"]
+    import io
+
+    from reportlab.pdfgen import canvas as rl_canvas
+
+    buffer = io.BytesIO()
+    pdf = rl_canvas.Canvas(buffer)
+    for index in range(101):
+        pdf.drawString(72, 720, f"page {index + 1}")
+        pdf.showPage()
+    pdf.save()
+    response = client.post(
+        f"/api/conversations/{conversation_id}/attachments",
+        files={"file": ("long.pdf", buffer.getvalue(), "application/pdf")},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert response.status_code == 413
+    assert "long" in response.json()["detail"]
+
+
 def test_oversize_text_rejected(client, admin):
     csrf = login(client, admin)
     conversation_id = _conversation(client, csrf)
@@ -138,3 +175,89 @@ def test_attachment_delete_removes_file(client, admin, settings):
     assert path.is_file()
     client.delete(f"/api/attachments/{attachment_id}", headers={"X-CSRF-Token": csrf})
     assert not path.exists()
+
+
+def test_body_limit_is_rejected_before_parsing_and_server_stays_healthy(client, admin):
+    """Borne ASGI cumulée : un corps au-dessus de la limite est refusé AVANT
+    parsing/spool multipart, et la requête suivante reste saine."""
+    csrf = login(client, admin)
+    conversation_id = _conversation(client, csrf)
+    oversize = b"%PDF-" + b"0" * (22 * 1024 * 1024)
+    response = client.post(
+        f"/api/conversations/{conversation_id}/attachments",
+        files={"file": ("enorme.pdf", oversize, "application/pdf")},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert response.status_code == 413
+    assert "volumineux" in response.json()["detail"]
+    healthy = _upload(client, csrf, conversation_id, "sain.txt", b"contenu sain")
+    assert healthy.status_code == 201, healthy.text
+
+
+def test_parser_process_is_really_killed_on_timeout(settings):
+    """Le sous-processus d'analyse est réellement TERMINÉ en cas de
+    dépassement : plus aucun processus orphelin après le kill."""
+    import os
+    import subprocess
+    import sys
+    import time
+
+    from app.routers import attachments as attachments_module
+
+    pidfile = settings.quarantine_dir / "parse-timeout-pid.txt"
+    pidfile.parent.mkdir(parents=True, exist_ok=True)
+    script = f"import os, time; open({str(pidfile)!r}, 'w').write(str(os.getpid())); time.sleep(60)"
+    started = time.time()
+    with pytest.raises(subprocess.TimeoutExpired):
+        attachments_module._execute_parser([sys.executable, "-c", script], b"{}", 1.0)
+    assert time.time() - started < 15
+    assert pidfile.is_file()
+    pid = int(pidfile.read_text())
+    deadline = time.time() + 5
+    alive = True
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            alive = False
+            break
+        time.sleep(0.1)
+    assert not alive, "le processus d'analyse doit être réellement terminé (kill + reap)"
+
+
+def test_parser_memory_bound_is_enforced_in_the_subprocess(settings):
+    """La mémoire du parseur est RÉELLEMENT bornée (RLIMIT_AS) : une allocation
+    au-delà de la limite échoue DANS le sous-processus (MemoryError contrôlée),
+    jamais en consommant la mémoire de l'API."""
+    import os
+    import subprocess
+    import sys
+
+    limit = 256 * 1024 * 1024  # 256 Mio pour le test
+    script = (
+        "from app.parse_runner import apply_parse_limits\n"
+        "apply_parse_limits()\n"
+        "try:\n"
+        "    data = bytearray(600 * 1024 * 1024)\n"  # 600 Mio > limite
+        "    print('ALLOCATED', len(data))\n"
+        "except MemoryError:\n"
+        "    print('BOUNDED')\n"
+    )
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "PYTHONPATH": os.environ.get("PYTHONPATH", "/app"),
+        "WALLIA_PARSE_MAX_MEMORY_BYTES": str(limit),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    completed = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=60, env=env
+    )
+    assert completed.returncode == 0, completed.stderr[-500:]
+    assert "BOUNDED" in completed.stdout, completed.stdout[-200:]
+
+    # L'API transmet bien la borne configurée au sous-processus d'analyse.
+    from app.routers import attachments as attachments_module
+
+    parser_env = attachments_module._parser_env(settings.upload_parse_max_memory_bytes)
+    assert parser_env["WALLIA_PARSE_MAX_MEMORY_BYTES"] == str(settings.upload_parse_max_memory_bytes)
+    assert settings.upload_parse_max_memory_bytes > 0

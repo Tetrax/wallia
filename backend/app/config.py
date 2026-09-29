@@ -84,6 +84,12 @@ class Settings:
     embedding_dim: int
     embedding_batch_size: int
 
+    reranker_backend: str
+    reranker_model: str
+    reranker_revision: str
+    reranker_weights_sha256: str
+    reranker_model_dir: Path
+
     allowed_origins: tuple[str, ...]
     trusted_proxy_cidrs: tuple[str, ...]
     trusted_proxy_networks: tuple[ipaddress._BaseNetwork, ...]
@@ -108,18 +114,21 @@ class Settings:
     retrieval_top_k: int
     retrieval_candidates: int
     retrieval_rrf_k: int
-    retrieval_min_cosine: float
 
     chat_max_seconds: int
     chat_max_history_messages: int
     chat_max_chars_per_message: int
     chat_max_context_chars: int
+    chat_max_concurrent: int
 
     upload_pdf_max_bytes: int
     upload_pdf_max_pages: int
     upload_text_max_bytes: int
     upload_image_max_bytes: int
     upload_image_max_pixels: int
+    upload_parse_timeout_seconds: int
+    upload_parse_concurrency: int
+    upload_parse_max_memory_bytes: int
 
     worker_poll_seconds: float
     worker_lease_seconds: int
@@ -130,6 +139,20 @@ class Settings:
     @property
     def is_production(self) -> bool:
         return self.env == "production"
+
+    @property
+    def stream_recovery_window_seconds(self) -> int:
+        """Fenêtre maximale RÉELLE d'un stream (+ marge).
+
+        Au-delà, un message resté « streaming » est abandonné : il ne bloque
+        plus la conversation et la recovery périodique le reprend.
+        """
+        return int(self.chat_max_seconds) + 60
+
+    @property
+    def upload_body_max_bytes(self) -> int:
+        """Borne ASGI cumulée du corps HTTP (encadrement multipart compris)."""
+        return max(self.upload_pdf_max_bytes, self.upload_text_max_bytes, self.upload_image_max_bytes) + 1024 * 1024
 
     @property
     def db_url(self) -> str:
@@ -225,6 +248,31 @@ def load_settings() -> Settings:
     if is_prod and embedding_backend != "e5":
         raise ConfigError("WALLIA_EMBEDDING_BACKEND=fixture interdit en production")
 
+    # Reclassement : backend réel obligatoire en production ; le backend
+    # `fixture` (mécanique de test sans sémantique) est explicitement refusé.
+    reranker_backend = _env("WALLIA_RERANKER_BACKEND", "transformers") or "transformers"
+    if is_prod and reranker_backend != "transformers":
+        raise ConfigError("WALLIA_RERANKER_BACKEND=fixture interdit en production")
+
+    # Identité du reclassement FIXE (docs/reranker-probe.md) : modèle,
+    # révision et empreinte des poids sont les constantes du module de
+    # reclassement. Un override d'environnement DIVERGENT est refusé au
+    # chargement — jamais une substitution silencieuse. Seul le chemin local
+    # du modèle est configurable.
+    from .reranking import MODEL_ID as _RERANKER_MODEL_ID
+    from .reranking import MODEL_REVISION as _RERANKER_REVISION
+    from .reranking import WEIGHTS_SHA256 as _RERANKER_SHA256
+
+    reranker_model = _env("WALLIA_RERANKER_MODEL", _RERANKER_MODEL_ID) or _RERANKER_MODEL_ID
+    if reranker_model != _RERANKER_MODEL_ID:
+        raise ConfigError(f"WALLIA_RERANKER_MODEL diverge de l'identité fixe ({_RERANKER_MODEL_ID})")
+    reranker_revision = _env("WALLIA_RERANKER_REVISION", _RERANKER_REVISION) or _RERANKER_REVISION
+    if reranker_revision != _RERANKER_REVISION:
+        raise ConfigError("WALLIA_RERANKER_REVISION diverge de la révision fixe")
+    reranker_weights_sha256 = _env("WALLIA_RERANKER_WEIGHTS_SHA256", _RERANKER_SHA256) or _RERANKER_SHA256
+    if reranker_weights_sha256 != _RERANKER_SHA256:
+        raise ConfigError("WALLIA_RERANKER_WEIGHTS_SHA256 diverge de l'empreinte fixe")
+
     settings = Settings(
         env=env,
         app_version=APP_VERSION,
@@ -243,6 +291,14 @@ def load_settings() -> Settings:
         or "",
         embedding_dim=_int_env("WALLIA_EMBEDDING_DIM", 384),
         embedding_batch_size=_int_env("WALLIA_EMBEDDING_BATCH_SIZE", 16),
+        # Reclassement (docs/reranker-probe.md) : identité fixe vérifiée
+        # ci-dessus (tout override divergent est refusé), chemin local
+        # configurable, aucun réglage de seuil ici.
+        reranker_backend=reranker_backend,
+        reranker_model=reranker_model,
+        reranker_revision=reranker_revision,
+        reranker_weights_sha256=reranker_weights_sha256,
+        reranker_model_dir=Path(_env("WALLIA_RERANKER_MODEL_DIR", "/opt/models/reranker") or "/opt/models/reranker"),
         allowed_origins=origins,
         trusted_proxy_cidrs=trusted,
         trusted_proxy_networks=tuple(networks),
@@ -262,19 +318,28 @@ def load_settings() -> Settings:
         provider_max_tokens=_int_env("WALLIA_PROVIDER_MAX_TOKENS", 1400),
         vision_enabled=_bool_env("WALLIA_VISION_ENABLED", False),
         web_enabled=_bool_env("WALLIA_WEB_ENABLED", False),
+        # Retrieval : filtres SQL avant sélection, pool borné (30 par défaut),
+        # fusion RRF, puis reclassement cross-encoder au seuil GELÉ
+        # (docs/reranker-probe.md) — plus aucune barrière cosinus/lexicale
+        # d'éligibilité, aucun réglage opérateur du seuil.
         retrieval_top_k=_int_env("WALLIA_RETRIEVAL_TOP_K", 6),
         retrieval_candidates=_int_env("WALLIA_RETRIEVAL_CANDIDATES", 30),
         retrieval_rrf_k=_int_env("WALLIA_RETRIEVAL_RRF_K", 60),
-        retrieval_min_cosine=_float_env("WALLIA_RETRIEVAL_MIN_COSINE", 0.84),
         chat_max_seconds=_int_env("WALLIA_CHAT_MAX_SECONDS", 240),
         chat_max_history_messages=_int_env("WALLIA_CHAT_MAX_HISTORY_MESSAGES", 20),
         chat_max_chars_per_message=_int_env("WALLIA_CHAT_MAX_CHARS_PER_MESSAGE", 6000),
         chat_max_context_chars=_int_env("WALLIA_CHAT_MAX_CONTEXT_CHARS", 24000),
+        chat_max_concurrent=_int_env("WALLIA_CHAT_MAX_CONCURRENT", 4),
         upload_pdf_max_bytes=_int_env("WALLIA_UPLOAD_PDF_MAX_BYTES", 20 * 1024 * 1024),
         upload_pdf_max_pages=_int_env("WALLIA_UPLOAD_PDF_MAX_PAGES", 100),
         upload_text_max_bytes=_int_env("WALLIA_UPLOAD_TEXT_MAX_BYTES", 1024 * 1024),
         upload_image_max_bytes=_int_env("WALLIA_UPLOAD_IMAGE_MAX_BYTES", 10 * 1024 * 1024),
         upload_image_max_pixels=_int_env("WALLIA_UPLOAD_IMAGE_MAX_PIXELS", 40_000_000),
+        upload_parse_timeout_seconds=_int_env("WALLIA_UPLOAD_PARSE_TIMEOUT_SECONDS", 30),
+        upload_parse_concurrency=_int_env("WALLIA_UPLOAD_PARSE_CONCURRENCY", 2),
+        # Borne mémoire du sous-processus d'analyse (RLIMIT_AS) : un fichier
+        # pathologique échoue dans SON processus, jamais dans l'API.
+        upload_parse_max_memory_bytes=_int_env("WALLIA_UPLOAD_PARSE_MAX_MEMORY_BYTES", 768 * 1024 * 1024),
         worker_poll_seconds=_float_env("WALLIA_WORKER_POLL_SECONDS", 2.0),
         worker_lease_seconds=_int_env("WALLIA_WORKER_LEASE_SECONDS", 300),
         worker_job_timeout_seconds=_int_env("WALLIA_WORKER_JOB_TIMEOUT_SECONDS", 1800),
@@ -289,3 +354,32 @@ def load_settings() -> Settings:
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return load_settings()
+
+
+# La transmission d'images au fournisseur n'est PAS implémentée : un simple
+# drapeau ne peut donc jamais rendre la vision « active » dans l'état exposé.
+VISION_TRANSMISSION_IMPLEMENTED = False
+
+
+def vision_availability(settings: Settings) -> tuple[bool, str | None]:
+    """Capacité EFFECTIVE de la vision (jamais le seul drapeau de configuration)."""
+    if not settings.vision_enabled:
+        return False, "analyse d'image inactive"
+    if not VISION_TRANSMISSION_IMPLEMENTED:
+        return False, "analyse d'image inactive (transmission non implémentée)"
+    return True, None
+
+
+# L'intégration Web (Firecrawl v2, vocabulaire fermé, repli borné du chat) est
+# implémentée : le drapeau d'environnement et l'activation opérateur (après
+# recette RAG) restent les deux verrous — l'un ne suffit jamais seul.
+WEB_INTEGRATION_IMPLEMENTED = True
+
+
+def web_availability(settings: Settings) -> tuple[bool, str | None]:
+    """Capacité EFFECTIVE de l'intégration Web (jamais le seul drapeau)."""
+    if not settings.web_enabled:
+        return False, "désactivé (activation opérateur après recette RAG)"
+    if not WEB_INTEGRATION_IMPLEMENTED:
+        return False, "intégration Web non active (hors périmètre prototype)"
+    return True, None

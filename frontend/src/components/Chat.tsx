@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { Attachment, Conversation, Message, Source } from "../types";
+import type { Attachment, Conversation, Message, Source, WebFallbackMeta } from "../types";
 import { attachmentUrl } from "../api";
 import { Markdown } from "../markdown";
 import { Badge, CopyButton, EmptyState, Spinner, formatBytes, formatDate } from "../ui";
@@ -10,9 +10,45 @@ export interface StreamingState {
   content: string;
   sources: Source[];
   sourcesStatus: string | null;
+  /** Statut du repli web observé pour cette génération (session courante). */
+  web: WebFallbackMeta | null;
   statusLabel: string | null;
   demo: boolean;
   error: string | null;
+}
+
+/**
+ * Statut opérationnel du repli web pour un message — affiché honnêtement,
+ * indépendamment du statut des sources corpus : indisponible ou sans résultat
+ * sont dits explicitement, jamais une procédure inventée ni un spinner
+ * fictionnel. `not_needed`/`disabled` relèvent de l'état connecteur (barre
+ * globale) et n'ajoutent rien au message. Il n'existe que pour la session en
+ * cours : après un reload, seule la provenance persistée des sources subsiste.
+ */
+function WebStatusNote({ web }: { web: WebFallbackMeta | null | undefined }) {
+  if (!web) return null;
+  const query = web.query ? ` · requête publique : ${web.query}` : "";
+  if (web.status === "ok") {
+    return (
+      <p className="web-note muted small">
+        Web constructeur public — version non vérifiée{query}. Résultats non qualifiés.
+      </p>
+    );
+  }
+  if (web.status === "no_results") {
+    return (
+      <p className="web-note muted small">Recherche web publique : aucun résultat{query}.</p>
+    );
+  }
+  if (web.status === "unavailable") {
+    return (
+      <p className="web-note muted small" title={web.reason ?? undefined}>
+        Recherche web complémentaire indisponible{web.reason ? ` (${web.reason})` : ""} — ne pas la
+        présenter comme active.
+      </p>
+    );
+  }
+  return null;
 }
 
 export function ChatView({
@@ -20,6 +56,7 @@ export function ChatView({
   messages,
   attachments,
   streaming,
+  messageWeb = {},
   providerConfigured,
   onSend,
   onStop,
@@ -35,6 +72,8 @@ export function ChatView({
   messages: Message[];
   attachments: Attachment[];
   streaming: StreamingState | null;
+  /** Statut web observé par message (session courante uniquement). */
+  messageWeb?: Record<string, WebFallbackMeta>;
   providerConfigured: boolean;
   onSend: (text: string, attachmentIds: string[]) => void;
   onStop: () => void;
@@ -46,12 +85,28 @@ export function ChatView({
   onCreateConversation: () => void;
   onOpenSidebar: () => void;
 }) {
-  const [draft, setDraft] = useState("");
-  const [pending, setPending] = useState<string[]>([]);
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [pendingByCase, setPendingByCase] = useState<Record<string, string[]>>({});
   const [dragOver, setDragOver] = useState(false);
   const [uploading, setUploading] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  // Brouillon et pièces en attente ISOLÉS par ID de cas : changer de
+  // conversation ne fait jamais fuiter le contenu d'un cas vers un autre.
+  const caseId = conversation?.id ?? "";
+  const caseIdRef = useRef(caseId);
+  caseIdRef.current = caseId;
+  const draft = drafts[caseId] ?? "";
+  const pending = pendingByCase[caseId] ?? [];
+  const setDraft = (value: string) => setDrafts((previous) => ({ ...previous, [caseId]: value }));
+  const addPending = (caseKey: string, id: string) =>
+    setPendingByCase((previous) => ({ ...previous, [caseKey]: [...(previous[caseKey] ?? []), id] }));
+  const removePending = (id: string) =>
+    setPendingByCase((previous) => ({
+      ...previous,
+      [caseId]: (previous[caseId] ?? []).filter((item) => item !== id),
+    }));
 
   const conversationAttachments = attachments;
 
@@ -68,11 +123,15 @@ export function ChatView({
   }, [draft]);
 
   const attach = async (files: FileList | File[]) => {
+    if (!hasConversation) return;
+    const startedFor = caseId;
     setUploading(true);
     try {
       for (const file of Array.from(files).slice(0, 5)) {
         const created = await onUpload(file);
-        if (created) setPending((prev) => [...prev, created.id]);
+        // Réponse tardive : si le cas affiché a changé, la pièce jointe ne
+        // doit jamais être rattachée au cas actuellement ouvert.
+        if (created && caseIdRef.current === startedFor) addPending(startedFor, created.id);
       }
     } finally {
       setUploading(false);
@@ -81,10 +140,10 @@ export function ChatView({
 
   const send = () => {
     const text = draft.trim();
-    if (!text || streaming) return;
+    if (!text || streaming || !hasConversation) return;
     onSend(text, pending);
     setDraft("");
-    setPending([]);
+    setPendingByCase((previous) => ({ ...previous, [caseId]: [] }));
   };
 
   const isStreaming = Boolean(streaming);
@@ -148,6 +207,7 @@ export function ChatView({
                 key={message.id}
                 message={message}
                 attachments={conversationAttachments}
+                web={messageWeb[message.id] ?? null}
                 onRetry={onRetry}
                 onOpenSources={onOpenSources}
               />
@@ -182,13 +242,27 @@ export function ChatView({
               const attachment = conversationAttachments.find((a) => a.id === id);
               return (
                 <span key={id} className="file-chip">
-                  <Paperclip size={12} /> {attachment?.filename ?? "pièce jointe"}
-                  {attachment?.kind === "image" ? <Badge tone="warn">vision inactive</Badge> : null}
+                  {attachment?.kind === "image" ? (
+                    <img
+                      className="file-thumb"
+                      src={attachmentUrl(id, true)}
+                      alt={`Aperçu de ${attachment.filename}`}
+                      title="Aperçu local — analyse d'image inactive : l'image n'est pas transmise au modèle."
+                    />
+                  ) : (
+                    <Paperclip size={12} />
+                  )}{" "}
+                  {attachment?.filename ?? "pièce jointe"}
+                  {attachment?.kind === "image" ? (
+                    <Badge tone="warn" title="Analyse d'image inactive : l'image n'est pas transmise au modèle.">
+                      vision inactive
+                    </Badge>
+                  ) : null}
                   <button
                     type="button"
                     className="btn btn-ghost btn-icon"
                     onClick={() => {
-                      setPending((prev) => prev.filter((item) => item !== id));
+                      removePending(id);
                       onDeleteAttachment(id);
                     }}
                     aria-label="Retirer la pièce jointe"
@@ -259,11 +333,13 @@ export function ChatView({
 function MessageBubble({
   message,
   attachments,
+  web,
   onRetry,
   onOpenSources,
 }: {
   message: Message;
   attachments: Attachment[];
+  web: WebFallbackMeta | null;
   onRetry: (id: string) => void;
   onOpenSources: (sources: Source[], messageId: string, status: string | null, highlight?: number) => void;
 }) {
@@ -282,11 +358,38 @@ function MessageBubble({
         <Markdown
           content={message.content}
           sourcesCount={sources.length}
-          onCitation={(index) => onOpenSources(sources, message.id, null, index)}
+          onCitation={(index) => {
+            if (sources.length === 0) {
+              // Citation historique dont les sources ne sont plus disponibles :
+              // signalée explicitement, jamais un panneau vide ambigu.
+              onOpenSources([], message.id, "sources_unavailable", index);
+              return;
+            }
+            onOpenSources(sources, message.id, null, index);
+          }}
         />
       ) : (
         <p className="user-text">{message.content}</p>
       )}
+      {message.role === "assistant" ? <WebStatusNote web={web} /> : null}
+      {linked.some((file) => file.kind === "image") ? (
+        <div className="message-images">
+          {linked
+            .filter((file) => file.kind === "image")
+            .map((file) => (
+              <a
+                key={file.id}
+                className="message-image"
+                href={attachmentUrl(file.id, true)}
+                target="_blank"
+                rel="noopener noreferrer"
+                title="Aperçu local — analyse d'image inactive : l'image n'est pas transmise au modèle."
+              >
+                <img src={attachmentUrl(file.id, true)} alt={`Aperçu de ${file.filename}`} />
+              </a>
+            ))}
+        </div>
+      ) : null}
       {linked.length > 0 ? (
         <div className="message-files">
           {linked.map((file) => (
@@ -303,14 +406,18 @@ function MessageBubble({
           </button>
           {sources.slice(0, 4).map((source, index) => (
             <button
-              key={source.chunk_id}
+              key={source.chunk_id ?? source.url ?? index}
               type="button"
               className="source-chip"
               onClick={() => onOpenSources(sources, message.id, null)}
               title={source.title}
             >
               [{index + 1}] {source.title.slice(0, 40)}
-              {source.page_start ? ` · p.${source.page_start}` : ""}
+              {source.source_type === "web"
+                ? " · web public — version non vérifiée"
+                : source.page_start
+                  ? ` · p.${source.page_start}`
+                  : ""}
             </button>
           ))}
         </div>
@@ -371,6 +478,7 @@ function StreamingBubble({
       ) : (
         <p className="muted">…</p>
       )}
+      <WebStatusNote web={state.web} />
       {state.sources.length > 0 ? (
         <div className="message-sources">
           <button

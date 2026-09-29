@@ -9,7 +9,6 @@ from fastapi import APIRouter, Depends, HTTPException, status
 
 from ..app_settings import (
     PROVIDER_KEY,
-    RETRIEVAL_KEY,
     effective_provider,
     get_row,
     last_provider_test,
@@ -26,7 +25,6 @@ router = APIRouter(prefix="/api/settings", tags=["settings"])
 
 def _public_settings(auth: AuthContext) -> dict:
     config = provider_config(auth.db, auth.settings)
-    retrieval = get_row(auth.db, RETRIEVAL_KEY) or {}
     return {
         "provider": {
             "endpoint": config["endpoint"],
@@ -36,8 +34,9 @@ def _public_settings(auth: AuthContext) -> dict:
             "vision_enabled": config["vision_enabled"],
             "allowed_domains": list(auth.settings.provider_allowed_domains),
         },
+        # Le seuil de reclassement est GELÉ (code, docs/reranker-probe.md) :
+        # aucun réglage opérateur n'est exposé ici.
         "retrieval": {
-            "min_cosine": float(retrieval.get("min_cosine", auth.settings.retrieval_min_cosine)),
             "top_k": auth.settings.retrieval_top_k,
         },
         "last_provider_test": last_provider_test(auth.db),
@@ -97,9 +96,6 @@ def put_settings(body: SettingsPatch, auth: AuthContext = Depends(csrf_guard)):
             pass
         except OSError as exc:
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"suppression impossible: {exc}")
-
-    if body.retrieval_min_cosine is not None:
-        set_row(db, RETRIEVAL_KEY, {**(get_row(db, RETRIEVAL_KEY) or {}), "min_cosine": body.retrieval_min_cosine}, commit=False)
 
     set_row(db, PROVIDER_KEY, updated, commit=False)
     db.commit()

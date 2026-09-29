@@ -1,0 +1,52 @@
+{
+  "name": "calibration-nova-boreal",
+  "version": 1,
+  "note": "Jeu de CALIBRATION distinct du corpus de démonstration et du jeu d'acceptance. Contenus fictifs inoffensifs. Sert à mesurer les cosinus E5 réels (positifs FR→EN/EN→FR/EN→EN/FR→FR et négatifs) et à choisir la barrière vectorielle AVANT l'acceptance. Aucun texte d'acceptance ne doit être copié ici et inversement.",
+  "corpus": [
+    {"id": "p1", "lang": "fr", "text": "Nova Boreal — le voyant vert fixe indique que la liaison est nominale."},
+    {"id": "p2", "lang": "fr", "text": "Sur Nova Boreal, la sauvegarde de configuration s'effectue depuis le menu Administration, option Exporter."},
+    {"id": "p3", "lang": "fr", "text": "Nova Boreal conserve les trente derniers contrôles dans son historique local."},
+    {"id": "p4", "lang": "fr", "text": "La purge manuelle de l'historique s'exécute uniquement hors tension de service."},
+    {"id": "p5", "lang": "fr", "text": "Le port de gestion écoute sur 8443 par défaut."},
+    {"id": "p6", "lang": "fr", "text": "Nova Boreal plafonne la taille de l'historique à 500 mégaoctets."},
+    {"id": "p7", "lang": "en", "text": "Nova Boreal stores diagnostics in the local history; the retention keeps the last thirty entries."},
+    {"id": "p8", "lang": "en", "text": "The management port defaults to 8443 and cannot be changed below firmware 3.0."},
+    {"id": "p9", "lang": "en", "text": "A flashing blue LED means a firmware update is in progress."},
+    {"id": "p10", "lang": "fr", "text": "Les événements système sont horodatés en UTC."},
+    {"id": "p12", "lang": "fr", "text": "Le certificat de gestion se renouvelle depuis le menu Sécurité."},
+    {"id": "p13", "lang": "en", "text": "Management certificates are renewed from the Security menu."},
+    {"id": "p14", "lang": "fr", "text": "Le câble console relie l'équipement au débit 115200 bauds."}
+  ],
+  "positives": [
+    {"id": "pos1", "question": "Quel voyant indique une liaison nominale ?", "lang": "fr", "target_lang": "fr", "expected": ["p1"]},
+    {"id": "pos2", "question": "Comment exporter la sauvegarde de configuration ?", "lang": "fr", "target_lang": "fr", "expected": ["p2"]},
+    {"id": "pos3", "question": "Combien de contrôles l'historique local conserve-t-il ?", "lang": "fr", "target_lang": "fr", "expected": ["p3"]},
+    {"id": "pos4", "question": "Comment purger manuellement l'historique ?", "lang": "fr", "target_lang": "fr", "expected": ["p4"]},
+    {"id": "pos5", "question": "Quel port de gestion utilise l'équipement par défaut ?", "lang": "fr", "target_lang": "fr", "expected": ["p5", "p8"]},
+    {"id": "pos6", "question": "Quelle est la taille maximale de l'historique ?", "lang": "fr", "target_lang": "fr", "expected": ["p6"]},
+    {"id": "pos7", "question": "Combien d'entrées la rétention conserve-t-elle ?", "lang": "fr", "target_lang": "en", "expected": ["p7"]},
+    {"id": "pos8", "question": "Que signifie une LED bleue clignotante ?", "lang": "fr", "target_lang": "en", "expected": ["p9"]},
+    {"id": "pos9", "question": "Les événements système sont-ils horodatés en UTC ?", "lang": "fr", "target_lang": "fr", "expected": ["p10"]},
+    {"id": "pos10", "question": "Comment renouveler le certificat de gestion ?", "lang": "fr", "target_lang": "fr", "expected": ["p12", "p13"]},
+    {"id": "pos11", "question": "Quel câble console et quel débit ?", "lang": "fr", "target_lang": "fr", "expected": ["p14"]},
+    {"id": "pos12", "question": "How many entries does the local history keep?", "lang": "en", "target_lang": "en", "expected": ["p7"]},
+    {"id": "pos13", "question": "What do the management certificates renew from?", "lang": "en", "target_lang": "en", "expected": ["p13"]},
+    {"id": "pos14", "question": "Le port de gestion est-il modifiable ?", "lang": "fr", "target_lang": "en", "expected": ["p8"]}
+  ],
+  "negatives": [
+    {"id": "neg1", "question": "Quel est le tarif annuel de la licence ?", "category": "hors_sujet", "gated": true},
+    {"id": "neg2", "question": "Quelles sont les conditions de revente et les remises volume ?", "category": "hors_sujet", "gated": true},
+    {"id": "neg3", "question": "Proposez-vous une formation certifiante pour les exploitants ?", "category": "hors_sujet", "gated": true},
+    {"id": "neg4", "question": "Quelle est la durée de garantie du matériel ?", "category": "hors_sujet", "gated": true},
+    {"id": "neg5", "question": "Combien coûte le support premium 24/7 ?", "category": "hors_sujet", "gated": true},
+    {"id": "neg6", "question": "Le service après-vente est-il joignable le week-end ?", "category": "hors_sujet", "gated": true},
+    {"id": "neg7", "question": "Peut-on régler en plusieurs fois ?", "category": "hors_sujet", "gated": true},
+    {"id": "neg8", "question": "Quelle est la procédure RH pour déclarer un congé ?", "category": "hors_sujet", "gated": true},
+    {"id": "neg9", "question": "Comment obtenir un devis pour 200 équipements ?", "category": "hors_sujet", "gated": true},
+    {"id": "neg10", "question": "La livraison en Europe est-elle incluse ?", "category": "hors_sujet", "gated": true},
+    {"id": "neg11", "question": "Nova Boreal 3.2 ?", "category": "piege_metadonnees", "gated": true},
+    {"id": "neg12", "question": "version 3.2 ?", "category": "piege_metadonnees", "gated": true},
+    {"id": "neg13", "question": "Quelle est l'autonomie de la batterie de secours ?", "category": "proche", "gated": false},
+    {"id": "neg14", "question": "firmware documentation", "category": "proche", "gated": false}
+  ]
+}

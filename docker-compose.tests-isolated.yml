@@ -1,0 +1,75 @@
+# Wallia — harnais de tests ISOLÉ (lot3). Projet compose dédié `wallia-tests`.
+#
+# Ne monte NI runtime/secrets NI runtime/data ; ne publie AUCUN port hôte ;
+# n'utilise jamais la pile `wallia` vivante (autre projet, autre réseau, autre
+# volume). Base PostgreSQL 17 + pgvector DÉDIÉE ; code backend monté en LECTURE
+# et exécuté dans l'image `wallia:local` existante ; le seul lien vers l'hôte
+# est `runtime/tests-isolated/`, racine d'isolation avec son secret de test
+# généré localement (jamais les secrets du runtime de livraison).
+#
+#   scripts/tests-isolated.sh [commande...]
+#     (défaut : python -m pytest -q -p no:cacheprovider tests)
+
+name: wallia-tests
+
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    restart: "no"
+    environment:
+      POSTGRES_DB: wallia
+      POSTGRES_USER: wallia
+      POSTGRES_PASSWORD_FILE: /run/isolation/db_password
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    volumes:
+      - wallia_tests_pgdata:/var/lib/postgresql/data
+      - ./runtime/tests-isolated:/run/isolation:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wallia -d wallia"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+    mem_limit: 512m
+    cpus: 1.0
+    networks: [tests]
+
+  runner:
+    image: ${WALLIA_IMAGE:-wallia:local}
+    restart: "no"
+    environment:
+      WALLIA_TEST_RUNNER: isolated
+      WALLIA_ENV: test
+      WALLIA_EMBEDDING_BACKEND: fixture
+      WALLIA_TEST_DB_URL: postgresql+psycopg://wallia:${WALLIA_TESTS_DB_PASSWORD:?secret de test requis}@db:5432/wallia
+      WALLIA_TEST_TMP: /tmp/wallia-tests
+      WALLIA_ACCEPTANCE_CORPUS: /run/isolation/live-corpus.json
+      WALLIA_ACCEPTANCE_QUERIES: /run/isolation/acceptance-vectors.json
+      WALLIA_CALIBRATION_VECTORS: /run/isolation/calibration-vectors.json
+      WALLIA_EVIDENCE_DIR: /run/isolation/evidence
+      HOME: /tmp
+      PYTHONPATH: /app
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      TOKENIZERS_PARALLELISM: "false"
+    volumes:
+      - ./backend:/app:ro
+      - ./resources:/app/resources:ro
+      - ./fixtures:/app/fixtures:ro
+      - ./runtime/tests-isolated:/run/isolation
+    read_only: true
+    tmpfs:
+      - /tmp:size=1024m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: ${WALLIA_TESTS_RUNNER_MEM:-1600m}
+    cpus: 2.0
+    networks: [tests]
+
+volumes:
+  wallia_tests_pgdata:
+    name: wallia_tests_pgdata
+
+networks:
+  tests:
+    name: wallia_tests_net
+    driver: bridge

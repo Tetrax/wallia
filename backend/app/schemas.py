@@ -122,7 +122,6 @@ class SettingsPatch(BaseModel):
     provider_timeout_s: float | None = Field(default=None, ge=5, le=600)
     api_key: str | None = Field(default=None, max_length=400)
     clear_api_key: bool = False
-    retrieval_min_cosine: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
 class DocumentMetaIn(BaseModel):

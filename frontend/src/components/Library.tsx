@@ -39,6 +39,7 @@ export function LibraryView() {
   const [scope, setScope] = useState("");
   const [docStatus, setDocStatus] = useState("");
   const [importOpen, setImportOpen] = useState(false);
+  const [editDoc, setEditDoc] = useState<DocumentItem | null>(null);
   const [chunkDoc, setChunkDoc] = useState<DocumentItem | null>(null);
   const [chunks, setChunks] = useState<ChunkItem[]>([]);
   const [chunksLoading, setChunksLoading] = useState(false);
@@ -202,6 +203,9 @@ export function LibraryView() {
                       <button type="button" className="btn btn-ghost btn-small" onClick={() => void openChunks(document)}>
                         Passages
                       </button>
+                      <button type="button" className="btn btn-ghost btn-small" onClick={() => setEditDoc(document)}>
+                        Métadonnées
+                      </button>
                       <button type="button" className="btn btn-ghost btn-small" onClick={() => void reindex(document)} disabled={document.status === "deleting"}>
                         Réindexer
                       </button>
@@ -271,6 +275,17 @@ export function LibraryView() {
 
       {importOpen ? <ImportModal onClose={() => setImportOpen(false)} onDone={() => void reload()} /> : null}
 
+      {editDoc ? (
+        <EditMetaModal
+          document={editDoc}
+          onClose={() => setEditDoc(null)}
+          onDone={() => {
+            setEditDoc(null);
+            void reload();
+          }}
+        />
+      ) : null}
+
       {chunkDoc ? (
         <Modal title={`Passages — ${chunkDoc.title}`} onClose={() => setChunkDoc(null)} wide>
           {chunksLoading ? (
@@ -294,6 +309,112 @@ export function LibraryView() {
         </Modal>
       ) : null}
     </section>
+  );
+}
+
+function EditMetaModal({
+  document,
+  onClose,
+  onDone,
+}: {
+  document: DocumentItem;
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const [title, setTitle] = useState(document.title);
+  const [origin, setOrigin] = useState(document.origin);
+  const [product, setProduct] = useState(document.product ?? "");
+  const [versions, setVersions] = useState(document.versions.join(", "));
+  const [language, setLanguage] = useState(document.language);
+  const [documentDate, setDocumentDate] = useState(document.document_date ?? "");
+  const [scope, setScope] = useState<"demo" | "official">(document.scope);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    setBusy(true);
+    setError(null);
+    try {
+      const versionList = versions
+        .split(",")
+        .map((value) => value.trim())
+        .filter(Boolean);
+      await api.patchDocument(document.id, {
+        title: title.trim() || document.title,
+        origin: origin.trim() || document.origin,
+        product: product.trim() || null,
+        versions: versionList,
+        language: language.trim() || document.language,
+        document_date: documentDate.trim() || null,
+        scope,
+      });
+      toast("success", "Métadonnées enregistrées.");
+      onDone();
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal title={`Métadonnées — ${document.title}`} onClose={onClose}>
+      <form className="form-grid" onSubmit={submit}>
+        <label>
+          Titre
+          <input value={title} onChange={(event) => setTitle(event.target.value)} maxLength={300} required />
+        </label>
+        <label>
+          Origine
+          <input value={origin} onChange={(event) => setOrigin(event.target.value)} maxLength={200} />
+        </label>
+        <label>
+          Produit
+          <input value={product} onChange={(event) => setProduct(event.target.value)} maxLength={200} />
+        </label>
+        <label>
+          Versions (séparées par des virgules)
+          <input value={versions} onChange={(event) => setVersions(event.target.value)} placeholder="10.9, 10.9.1" />
+        </label>
+        <label>
+          Langue
+          <select value={language} onChange={(event) => setLanguage(event.target.value)}>
+            <option value="fr">Français</option>
+            <option value="en">Anglais</option>
+            <option value="other">Autre</option>
+          </select>
+        </label>
+        <label>
+          Date du document (optionnel)
+          <input type="date" value={documentDate} onChange={(event) => setDocumentDate(event.target.value)} />
+        </label>
+        <label>
+          Périmètre
+          <select
+            value={scope}
+            onChange={(event) => setScope(event.target.value as "demo" | "official")}
+            disabled={document.demo}
+            title={document.demo ? "Un document de démonstration ne peut pas être marqué officiel." : undefined}
+          >
+            <option value="demo">Démonstration</option>
+            <option value="official">Officiel</option>
+          </select>
+        </label>
+        {document.demo ? (
+          <p className="muted small">Document de démonstration : le périmètre « officiel » reste refusé par le serveur.</p>
+        ) : null}
+        {error ? <p className="form-error">{error}</p> : null}
+        <div className="modal-actions">
+          <button type="button" className="btn btn-ghost" onClick={onClose}>
+            Annuler
+          </button>
+          <button type="submit" className="btn btn-primary" disabled={busy}>
+            {busy ? "Enregistrement…" : "Enregistrer les métadonnées"}
+          </button>
+        </div>
+      </form>
+    </Modal>
   );
 }
 

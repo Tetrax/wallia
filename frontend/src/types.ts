@@ -28,28 +28,63 @@ export interface CaseState {
 }
 
 export interface Source {
-  chunk_id: string;
-  document_id: string;
+  /** Discriminant de provenance ; absent = corpus (snapshots antérieurs). */
+  source_type?: "corpus" | "web";
+  chunk_id: string | null;
+  document_id: string | null;
   title: string;
   product: string | null;
   versions: string[];
   demo: boolean;
   scope: string;
-  language: string;
+  language: string | null;
   page_start: number | null;
   page_end: number | null;
   section: string | null;
   kind: string;
   text: string;
-  score: number;
+  /** Logit brut du reclassement (classement réel) — jamais une probabilité ;
+   *  null pour une source web (aucun score factice). */
+  score: number | null;
+  score_kind?: string | null;
   score_vector: number | null;
   score_text: number | null;
+  /** Disponibilité résolue du document cité (false = document supprimé). */
+  available?: boolean;
+  /** Source web uniquement : URL publique HTTPS + domaine + état de version. */
+  url?: string | null;
+  domain?: string | null;
+  version_state?: string | null;
 }
 
 export interface RetrievalPayload {
-  status: "ok" | "no_relevant_source" | "empty_corpus" | "embeddings_unavailable";
+  status: "ok" | "no_relevant_source" | "empty_corpus" | "embeddings_unavailable" | "retrieval_unavailable";
   sources: Source[];
   diagnostics: Record<string, unknown>;
+  /** Métadonnée opérationnelle du repli web — absente des anciens flux. */
+  web?: WebFallbackMeta;
+}
+
+/** Statut du repli web pour un tour : état opérationnel, jamais une preuve
+ *  d'appel ; la barre globale reste l'état du connecteur. */
+export interface WebFallbackMeta {
+  status: "not_needed" | "disabled" | "unavailable" | "no_results" | "ok";
+  reason: string | null;
+  /** Requête réellement envoyée — vocabulaire fermé public uniquement. */
+  query: string | null;
+}
+
+export interface RerankerPayload {
+  backend: string;
+  model: string;
+  revision: string;
+  weights_sha256?: string;
+  threshold?: number;
+  max_length?: number;
+  batch_size?: number;
+  state?: string;
+  error_type?: string | null;
+  note?: string;
 }
 
 export interface Message {
@@ -148,11 +183,12 @@ export interface StatusPayload {
     model: string;
     key_configured: boolean;
     vision_enabled: boolean;
+    vision_effective?: boolean;
     last_test: Record<string, unknown> | null;
   };
   web: { available: boolean; reason: string | null };
   vision: { available: boolean; reason: string | null };
-  retrieval: { min_cosine: number; top_k: number };
+  retrieval: { top_k: number; reranker: RerankerPayload };
   corpus: { documents_total: number; documents_by_status: Record<string, number>; chunks_serving: number };
   jobs: {
     by_status: Record<string, number>;
@@ -169,7 +205,7 @@ export interface SettingsPayload {
     vision_enabled: boolean;
     allowed_domains: string[];
   };
-  retrieval: { min_cosine: number; top_k: number };
+  retrieval: { top_k: number };
   last_provider_test: Record<string, unknown> | null;
   env: string;
 }

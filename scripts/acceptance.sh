@@ -40,8 +40,10 @@ run_stage() { # run_stage nom fonction
 }
 
 stage_tests() {
-  "${COMPOSE[@]}" up -d api worker
-  "${COMPOSE[@]}" exec -T api python -m pytest -q tests
+  # La suite ne tourne JAMAIS dans le conteneur api vivant (secrets/données
+  # réels, OOM) : elle s'exécute dans le harnais isolé dédié (base pgvector
+  # séparée, limites explicites, aucun montage runtime/secrets ni runtime/data).
+  "$WALLIA_DIR/scripts/tests-isolated.sh"
 }
 
 stage_frontend() {
@@ -100,6 +102,9 @@ case "$STAGE" in
   streaming) run_stage streaming stage_streaming ;;
   e2e) run_stage e2e stage_e2e ;;
   all)
+    if [[ "${WALLIA_ACCEPTANCE_ALL:-0}" != "1" ]]; then
+      die "étape all refusée par défaut : elle mute la pile vivante (redémarrage API/worker, connecteur fake-upstream, e2e). Préférer les étapes individuelles ; pour forcer en connaissance de cause : WALLIA_ACCEPTANCE_ALL=1 scripts/acceptance.sh all."
+    fi
     run_stage frontend stage_frontend
     run_stage tests stage_tests
     run_stage corpus stage_corpus

@@ -4,7 +4,8 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 from sqlalchemy import func, select, text
 
-from ..app_settings import last_provider_test, provider_config, retrieval_config, worker_alive, worker_heartbeat
+from ..app_settings import last_provider_test, provider_config, worker_alive, worker_heartbeat
+from ..config import vision_availability, web_availability
 from ..deps import AuthContext, require_user
 from ..models import Chunk, Document, IngestionJob
 from ..serializers import user_out
@@ -39,9 +40,21 @@ def app_status(auth: AuthContext = Depends(require_user)):
         embedding = {"backend": settings.embedding_backend, "model": settings.embedding_model,
                      "revision": settings.embedding_revision, "dim": settings.embedding_dim,
                      "note": "service non initialisé"}
+    # Reclassement : état RÉEL du service (readiness, modèle, révision, seuil),
+    # jamais le seul drapeau de configuration.
+    reranker = None
+    try:
+        from ..reranking import get_reranker_service
+
+        reranker = get_reranker_service().info
+    except Exception:  # noqa: BLE001 - jamais bloquant
+        reranker = {"backend": settings.reranker_backend, "model": settings.reranker_model,
+                    "revision": settings.reranker_revision,
+                    "note": "service non initialisé"}
 
     heartbeat = worker_heartbeat(db)
-    retrieval = retrieval_config(db, settings)
+    web_effective, web_reason = web_availability(settings)
+    vision_effective, vision_reason = vision_availability(settings)
     return {
         "app": {
             "version": settings.app_version,
@@ -56,11 +69,14 @@ def app_status(auth: AuthContext = Depends(require_user)):
             "model": provider["model"],
             "key_configured": provider["key_configured"],
             "vision_enabled": provider["vision_enabled"],
+            "vision_effective": vision_effective,
             "last_test": last_provider_test(db),
         },
-        "web": {"available": settings.web_enabled, "reason": None if settings.web_enabled else "désactivé (intégration réservée après recette RAG)"},
-        "vision": {"available": settings.vision_enabled, "reason": None if settings.vision_enabled else "analyse d'image inactive"},
-        "retrieval": retrieval,
+        # Capacités EFFECTIVES : un drapeau de configuration ne suffit jamais à
+        # déclarer une fonction active (vision non transmise, Web non branché).
+        "web": {"available": web_effective, "reason": web_reason},
+        "vision": {"available": vision_effective, "reason": vision_reason},
+        "retrieval": {"top_k": settings.retrieval_top_k, "reranker": reranker},
         "corpus": {
             "documents_total": int(sum(doc_counts.values())) if doc_counts else 0,
             "documents_by_status": {k: int(v) for k, v in doc_counts.items()},

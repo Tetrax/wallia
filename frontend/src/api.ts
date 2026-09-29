@@ -10,6 +10,7 @@ import type {
   Source,
   StatusPayload,
   User,
+  WebFallbackMeta,
 } from "./types";
 
 let csrfToken: string | null = null;
@@ -66,7 +67,12 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 export interface ChatHandlers {
   onMeta?: (payload: { message_id: string; conversation_id: string; model: string | null; demo: boolean }) => void;
   onStatus?: (payload: { state: string; label: string }) => void;
-  onSources?: (payload: { status: string; sources: Source[]; diagnostics: Record<string, unknown> }) => void;
+  onSources?: (payload: {
+    status: string;
+    sources: Source[];
+    diagnostics: Record<string, unknown>;
+    web?: WebFallbackMeta | null;
+  }) => void;
   onDelta?: (text: string) => void;
   onDone?: (payload: { message_id: string; status: string; model: string | null; demo: boolean; sources_count?: number }) => void;
   onError?: (payload: { message: string; retryable: boolean; message_id: string }) => void;
@@ -117,6 +123,53 @@ export function attachmentUrl(id: string, inline = false): string {
 export function documentOriginalUrl(id: string, page?: number | null): string {
   const base = `/api/documents/${id}/original`;
   return page && page > 0 ? `${base}#page=${page}` : base;
+}
+
+/**
+ * Mêmes règles que le serveur avant de proposer un lien web (parité) :
+ * HTTPS, domaine wallix.com (ou sous-domaine), autorité BRUTE contrôlée
+ * AVANT toute normalisation URL/IDNA — ASCII uniquement, sans « @ » (userinfo
+ * même vide), sans percent-encoding, sans espace brut —, labels DNS complets
+ * (pas de tiret en début/fin, ≤ 63 caractères, host ≤ 253, aucun label vide),
+ * aucune info utilisateur, aucun port hors 443, ni fragment, backslash ou
+ * caractère de contrôle. La résolution DNS reste côté serveur (aucune URL
+ * résultat n'est jamais appelée) ; ici, une URL non conforme n'est
+ * simplement jamais rendue ouvrable.
+ */
+export function isAllowedWebUrl(url: string | null | undefined): boolean {
+  if (!url || typeof url !== "string") return false;
+  if (url.includes("\\") || url.includes("#")) return false;
+  for (const ch of url) {
+    const code = ch.charCodeAt(0);
+    if (code < 0x20 || code === 0x7f) return false;
+  }
+  // Autorité BRUTE, telle qu'écrite : jamais une forme réécrite par le parseur.
+  const marker = url.indexOf("://");
+  if (marker < 0) return false;
+  let authority = url.slice(marker + 3);
+  for (const separator of ["/", "?", "#"]) {
+    const index = authority.indexOf(separator);
+    if (index >= 0) authority = authority.slice(0, index);
+  }
+  if (!authority || authority.length > 261) return false;
+  if (!/^[!-~]+$/.test(authority)) return false; // ASCII imprimable uniquement
+  if (/[@%]/.test(authority)) return false; // userinfo même vide, percent-encoding
+  if ((authority.match(/:/g) || []).length > 1) return false; // un seul « : » (port)
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== "https:") return false;
+  if (parsed.username || parsed.password) return false;
+  if (parsed.port && parsed.port !== "443") return false;
+  const host = parsed.hostname.toLowerCase();
+  if (host.length === 0 || host.length > 253) return false;
+  const labels = host.split(".");
+  if (labels.length < 2) return false;
+  if (!labels.every((label) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))) return false;
+  return host === "wallix.com" || host.endsWith(".wallix.com");
 }
 
 export const api = {

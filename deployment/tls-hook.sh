@@ -1,26 +1,28 @@
 #!/usr/bin/env bash
-# Wallia — hook de renouvellement TLS (À ADAPTER AUX CONVENTIONS DU VPS).
+# Wallia — hook de renouvellement TLS (délégué à l'activateur root).
 #
-# Ce hook est prévu pour être appelé par l'outil de gestion des certificats
-# (certbot / paire gérée) APRÈS renouvellement. Il vérifie la paire active puis
-# recharge Nginx. Il n'est pas installé automatiquement par l'implémenteur.
+# Appelé par certbot APRÈS un renouvellement, SOUS le verrou infra déjà
+# détenu par certbot : ce hook ne reprend JAMAIS le verrou (aucune acquisition
+# imbriquée, aucun deadlock de renouvellement).
+#
+# Politique : NO-OP pour toute lignée autre que wallia.valdev.me — ce hook
+# peut être installé globalement sans toucher aux autres domaines du VPS.
+# L'activateur est un chemin FIXE (root-owned, installé par l'opérateur) :
+# aucun override d'environnement pour un script exécuté par root.
 set -euo pipefail
 
-CERT_NAME="${WALLIA_TLS_NAME:-wallia.valdev.me}"
-CERT_DIR="${WALLIA_TLS_DIR:-/etc/letsencrypt/live/${CERT_NAME}}"
+WALLIA_DOMAIN="wallia.valdev.me"
+ACTIVATOR="/usr/local/sbin/wallia-tls-activate"
+lineage="${RENEWED_LINEAGE:-}"
 
-if [[ ! -f "$CERT_DIR/fullchain.pem" || ! -f "$CERT_DIR/privkey.pem" ]]; then
-  echo "[wallia-tls] paire absente pour $CERT_NAME : rien à faire" >&2
+if [[ "$lineage" != "/etc/letsencrypt/live/$WALLIA_DOMAIN" ]]; then
+  echo "[wallia-tls] lignée « ${lineage:-absente} » différente de $WALLIA_DOMAIN : aucune action"
+  exit 0
+fi
+
+if [[ ! -x "$ACTIVATOR" ]]; then
+  echo "[wallia-tls] activateur absent ou non exécutable : $ACTIVATOR" >&2
   exit 1
 fi
 
-# La clé privée ne doit jamais être lisible par tous.
-mode="$(stat -c '%a' "$CERT_DIR/privkey.pem")"
-if [[ "$mode" != "600" && "$mode" != "640" ]]; then
-  echo "[wallia-tls] permissions inhabituelles sur privkey.pem ($mode)" >&2
-fi
-
-openssl x509 -in "$CERT_DIR/fullchain.pem" -noout -enddate | sed 's/^/[wallia-tls] validité : /'
-nginx -t
-systemctl reload nginx
-echo "[wallia-tls] Nginx rechargé après renouvellement de $CERT_NAME"
+exec "$ACTIVATOR" --activate

@@ -9,6 +9,7 @@ x-common-env: &common-env
   WALLIA_SECRETS_DIR: /secrets
   WALLIA_DATA_DIR: /data
   WALLIA_MODEL_DIR: /opt/models/e5-small
+  WALLIA_RERANKER_MODEL_DIR: ${WALLIA_RERANKER_MODEL_DIR:-/opt/models/reranker}
   WALLIA_DOCLING_MODELS: /opt/docling-models
   WALLIA_FRONTEND_DIR: /app/static
   WALLIA_EMBEDDING_REVISION: ${WALLIA_EMBEDDING_REVISION:-614241f622f53c4eeff9890bdc4f31cfecc418b3}
@@ -66,7 +67,6 @@ services:
       WALLIA_API_BASE_URL: http://api:8000
     volumes:
       - ./runtime/data:/data
-      - ./runtime/evidence/container:/data/evidence
       - ./runtime/secrets:/secrets
     ports:
       - "127.0.0.1:13745:8000"
@@ -78,8 +78,8 @@ services:
       - /tmp:size=768m
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
-    # La limite de l'API est paramétrable : la suite de tests démarre un serveur
-    # supplémentaire DANS ce conteneur (scripts/acceptance.sh relève la limite).
+    # Marge mémoire modulable de l'API (WALLIA_API_MEM_LIMIT) ; la ressource
+    # réelle sera ajustée d'après des mesures, jamais d'après une hypothèse.
     mem_limit: ${WALLIA_API_MEM_LIMIT:-1200m}
     cpus: 2.0
     logging: *logging
@@ -94,7 +94,6 @@ services:
       WALLIA_API_BASE_URL: http://api:8000
     volumes:
       - ./runtime/data:/data
-      - ./runtime/evidence/container:/data/evidence
       - ./runtime/secrets:/secrets
     depends_on:
       db:

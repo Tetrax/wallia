@@ -12,7 +12,6 @@ from .models import Setting
 from .security import utcnow
 
 PROVIDER_KEY = "provider"
-RETRIEVAL_KEY = "retrieval"
 PROVIDER_LAST_TEST_KEY = "provider_last_test"
 WORKER_HEARTBEAT_KEY = "worker_heartbeat"
 
@@ -20,10 +19,6 @@ DEFAULT_PROVIDER: dict[str, Any] = {
     "endpoint": None,  # None → valeur d'environnement
     "model": None,
     "timeout_s": None,
-}
-
-DEFAULT_RETRIEVAL: dict[str, Any] = {
-    "min_cosine": None,  # None → valeur d'environnement
 }
 
 
@@ -66,15 +61,6 @@ def effective_provider(db: Session, settings: Settings) -> Provider:
         model=config["model"],
         timeout_s=config["timeout_s"],
     )
-
-
-def retrieval_config(db: Session, settings: Settings) -> dict[str, Any]:
-    row = get_row(db, RETRIEVAL_KEY) or {}
-    min_cosine = row.get("min_cosine")
-    return {
-        "min_cosine": float(min_cosine) if min_cosine is not None else settings.retrieval_min_cosine,
-        "top_k": settings.retrieval_top_k,
-    }
 
 
 def last_provider_test(db: Session) -> dict[str, Any] | None:

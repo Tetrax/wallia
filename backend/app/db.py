@@ -24,6 +24,9 @@ def get_engine():
             max_overflow=5,
             pool_timeout=30,
             future=True,
+            # Les paramètres liés ne doivent JAMAIS apparaître dans un rendu
+            # d'erreur (texte utilisateur, vecteurs, paramètres sensibles).
+            hide_parameters=True,
         )
     return _engine
 
