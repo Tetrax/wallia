@@ -15,7 +15,12 @@ from app.prompts import (
     sources_block,
 )
 
-RESOURCES_DIR = Path(__file__).resolve().parents[1] / "resources"
+# Deux layouts explicites supportés : checkout (repo/backend/tests -> repo/resources)
+# et image (/app/tests -> /app/resources). Aucun skip ni redirection.
+_RESOURCES_CANDIDATES = tuple(
+    parent / "resources" for parent in list(Path(__file__).resolve().parents)[1:3]
+)
+RESOURCES_DIR = next((path for path in _RESOURCES_CANDIDATES if path.is_dir()), _RESOURCES_CANDIDATES[0])
 
 
 def test_detect_injection_markers():
