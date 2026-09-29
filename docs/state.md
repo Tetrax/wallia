@@ -2,7 +2,25 @@
 
 ## Statut
 
-**REPRISE AUTORISÉE — priorité à un accès de test utilisateur ; le parent reprend les opérations, sans writer concurrent. Livraison finale toujours NON FAITE.**
+**ACCÈS DE TEST OPÉRATIONNEL — https://wallia.valdev.me, authentification et dialogue DeepSeek natif vérifiés. La recette de livraison complète reste ouverte.**
+
+## Accès de test vérifié — 2026-09-29, après run209
+
+Le parent Desktop a levé le blocage de réconciliation Obsidian par les outils natifs, sauvegardé Wallia puis publié et déployé le code applicatif `19a9c9a0e921d8b494e3171e232ffbd7859e8bdd`. Image active à ce checkpoint : `sha256:edad7c4b5adbe972a72129d9f2591bdd70a8f48ec75194cfaaa3029621f68b63`. API/worker/DB healthy, aucun bind de code, seulement `/data` et `/secrets`. Les manifestes autoritatifs de déploiement sont `runtime/deploy-state/current.json` et `previous.json`, tous deux validés. Le correctif ultérieur `bde496debad294b531a690f37d135cb1c1e726a8` touche uniquement le chemin de ressources d'un test ; il ne change pas le code applicatif déployé. Ne pas confondre HEAD source, image active et recette finale.
+
+Preuves réellement exécutées :
+- `scripts/backup.sh`, `scripts/build.sh --deliver` et `scripts/deploy.sh --env-file runtime/secrets/app.production.env --skip-build` : exit0. L'image a exécuté sans réseau ses contrôles E5, cross-encoder et Docling (2 pages et 1 tableau), avec manifestes des poids vérifiés. Journaux `runtime/evidence/preview-parent-{backup,build,deploy}.log`.
+- HTTPS200 sans `-k`, HTTP301, accès anonyme aux documents/réglages401, `/internal/`404. Certificat Let's Encrypt dédié, paire gérée et empreinte servie vérifiées ; expiration2026-12-28, hook dédié installé, timer Certbot actif. Le dry-run de renouvellement et la restauration complète restent non exercés à ce jalon.
+- Page de connexion chargée dans Chromium réel : HTTP200, aucune erreur JavaScript ; capture `runtime/evidence/preview-login-desktop.png`. L'aperçu Desktop de Valentin affiche également la page de connexion. Pas de nouvelle recette navigateur authentifiée desktop/mobile complète revendiquée.
+- API DeepSeek NATIVE autorisée, distincte du coding : clé dédiée0600, endpoint `https://api.deepseek.com/v1`, modèle `deepseek-flash`. Ancien réglage en base pointant sur le faux fournisseur remplacé via l'API avec CSRF, puis relu. Test d'inférence réel réussi, latence604ms. Aucun secret imprimé ni credential Hermes monté dans l'application.
+- Chat réel HTTPS/SSE terminé en 4.383 s : « Combien de jours de journaux la rotation conserve-t-elle dans Aster 10.10 ? » → réponse « sept jours », citation exacte du Quick Start anglais page 2. Message `316fdef7-0784-4a19-b339-6adde9714e7d`, conversation `5ea13b04-0ee4-422c-94e9-aae66bb7716a` (« Recette native — corpus fictif »). Réponse persistée relue, identifiants document/chunk et page vérifiés par API ; génération native `demo=false`, document explicitement fictif `demo=true`. Preuves `runtime/evidence/preview-native-probe-{setup,ingest,chat}.json`.
+- Les quatre PDF fictifs Aster déjà présents sont `ready` et leurs passages/pages/générations sont vérifiés. Les réimports ont tous renvoyé409 : **ce n'est PAS une nouvelle ingestion** sur l'image livrée. Une nouvelle ingestion utilisateur reste à recetter, sans supprimer ce corpus.
+
+Accès : compte `admin@wallia.local`, mot de passe initial conservé uniquement dans `/home/tetrax/workspace/wallia/runtime/initial-access.txt`, propriétaire `tetrax`, mode0600. Aucune valeur de secret dans le compte rendu. Web et vision désactivés explicitement ; aucune documentation officielle WALLIX fournie ou validée.
+
+CI : le premier run36580202745 avait249PASS/1SKIP/1FAIL, uniquement le chemin `backend/resources` inexistant dans le checkout. Correction minimale par DeepSeek files-only, relue par Astra ; 10tests ciblés PASS dans le runner isolé. **Run36582600663 sur `bde496debad294b531a690f37d135cb1c1e726a8` terminé SUCCESS**, backend, frontend et hygiène compris ; journal `runtime/evidence/preview-ci-quality-fixed.log`. Cette CI concerne le correctif de test, pas le SHA19a9c9a de l'image active, dont le code applicatif est identique. La sonde opérateur est ignorée sous `runtime/preview_native_probe.py` ; aucun codeur actif après sa reprise terminée exit0, session `20260929_141020_4fa255`, écritures vérifiées limitées à la sonde et au test. Le premier essai22tours n'avait fait que des lectures ; il n'est pas compté comme livraison.
+
+**Reste pour la livraison complète :** nouvelle ingestion sur l'image active, recette UI authentifiée desktop/mobile finale, persistance/recréation et restore/rollback réels, renouvellementTLS, revue/PR/CI exact-head et alignement final image/source. Les anciens scripts d'acceptance live ne doivent pas être relancés aveuglément. La carte `t_0e0d0075` reste ouverte ; aucun second orchestrateur/redispatch lancé. Les paragraphes suivants sont historiques et ne décrivent ni un worker actif ni un blocage d'accès actuel.
 
 ## Priorité utilisateur — 2026-09-29 après run209
 
